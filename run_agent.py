@@ -10044,6 +10044,22 @@ class AIAgent:
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
 
+        # Turn-boundary outcome inference.  Most sessions never get an explicit
+        # reaction from gateway/telegram, so the outcome column stays NULL and
+        # reflection has nothing to learn from.  Infer a coarse signal from the
+        # *next* user message's feedback markers when available — fire-and-forget.
+        try:
+            from agent.outcome_signals import infer_outcome_from_turn
+            inferred = infer_outcome_from_turn(
+                original_user_message, final_response, None
+            )
+            if inferred is not None and self._session_db and self.session_id:
+                self._session_db.record_outcome(
+                    self.session_id, inferred, "turn_heuristic", None
+                )
+        except Exception as exc:
+            logger.debug("turn-boundary record_outcome failed: %s", exc)
+
         return result
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
