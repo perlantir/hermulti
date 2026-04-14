@@ -37,12 +37,20 @@ jobs:
       - name: Run tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
+          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --ignore=tests/bench --tb=short -n auto
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+      - name: Hot-path bench (Phase 11 perf gate)
+        # Runs after the main suite so a perf regression lands with a clean
+        # signal rather than buried in the full-suite summary. Serial run
+        # avoids xdist's worker variance dominating the p95 samples.
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/bench/ -o addopts='' --tb=short
 
   e2e:
     runs-on: ubuntu-latest
