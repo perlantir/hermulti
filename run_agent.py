@@ -5584,9 +5584,20 @@ class AIAgent:
         try:
             from tools.vision_tools import vision_analyze_tool
 
-            result_json = asyncio.run(
-                vision_analyze_tool(image_url=vision_source, user_prompt=analysis_prompt)
-            )
+            coro = vision_analyze_tool(image_url=vision_source, user_prompt=analysis_prompt)
+            # Safe for both sync CLI paths (no loop) and gateway threads
+            # where an event loop is already running: nesting asyncio.run()
+            # inside a live loop raises RuntimeError under concurrency.
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop and running_loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    result_json = pool.submit(asyncio.run, coro).result()
+            else:
+                result_json = asyncio.run(coro)
             result = json.loads(result_json) if isinstance(result_json, str) else {}
             description = (result.get("analysis") or "").strip()
         except Exception as e:
