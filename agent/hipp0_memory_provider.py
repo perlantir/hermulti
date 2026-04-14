@@ -800,7 +800,8 @@ class Hipp0MemoryProvider(MemoryProvider):
                     }
                 )
                 # Rough token estimate: 4 chars per token.
-                total_tokens = max(1, len(text) // 4)
+                from agent.model_metadata import estimate_tokens_rough
+                total_tokens = max(1, estimate_tokens_rough(text))
         logger.warning("HIPP0 compile degraded: %s", reason)
         return CompiledContext(
             decisions=decisions,

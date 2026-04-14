@@ -1082,4 +1082,5 @@ def estimate_prompt_tokens(prompt: str) -> int:
     """
     if not prompt:
         return 0
-    return max(1, len(prompt) // 4)
+    from agent.model_metadata import estimate_tokens_rough
+    return max(1, estimate_tokens_rough(prompt))

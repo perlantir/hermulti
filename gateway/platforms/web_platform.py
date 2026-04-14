@@ -195,7 +195,8 @@ class _Hipp0SyncAdapter:
         self._emit({"type": "hipp0_event", "event": "capture_start"})
         t0 = time.time()
         transcript = f"USER: {user_content}\nASSISTANT: {assistant_content}"
-        transcript_tokens = max(1, len(transcript) // 4)
+        from agent.model_metadata import estimate_tokens_rough
+        transcript_tokens = max(1, estimate_tokens_rough(transcript))
         try:
             result = self._loop.run_until_complete(
                 self._provider.capture(transcript, source="hermes")
@@ -668,7 +669,8 @@ async def _handle_message(
                 # Emit agent_setup event after first init
                 try:
                     profile = get_agent(agent_name)
-                    soul_tokens = max(1, len(profile.soul) // 4) if profile.soul else 0
+                    from agent.model_metadata import estimate_tokens_rough as _est_tok
+                    soul_tokens = max(1, _est_tok(profile.soul)) if profile.soul else 0
                     ws_emit({
                         "type": "agent_setup",
                         "agent_name": agent_name,
@@ -696,8 +698,9 @@ async def _handle_message(
         })
 
     # Estimate tokens and cost for audit trail
-    input_tokens_est = max(1, len(content) // 4) + 2000  # user msg + system prompt estimate
-    output_tokens_est = max(1, len(final_response) // 4) if final_response else 0
+    from agent.model_metadata import estimate_tokens_rough as _est_tok
+    input_tokens_est = max(1, _est_tok(content)) + 2000  # user msg + system prompt estimate
+    output_tokens_est = max(1, _est_tok(final_response)) if final_response else 0
     # Cost rates per million tokens
     cost_rates = {
         "claude-sonnet-4-6": (3.0, 15.0),

@@ -430,7 +430,8 @@ class TrajectoryCompressor:
             return len(self.tokenizer.encode(text))
         except Exception:
             # Fallback to character estimate
-            return len(text) // 4
+            from agent.model_metadata import estimate_tokens_rough
+            return estimate_tokens_rough(text)
     
     def count_trajectory_tokens(self, trajectory: List[Dict[str, str]]) -> int:
         """Count total tokens in a trajectory."""
