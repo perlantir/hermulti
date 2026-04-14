@@ -510,6 +510,19 @@ class _AnthropicCompletionsAdapter:
         if temperature is not None:
             anthropic_kwargs["temperature"] = temperature
 
+        # Cost-ceiling gate: refuse the call if this project is already over
+        # its daily budget. Best-effort — a missing project id or governor
+        # failure falls through to the call rather than blocking.
+        try:
+            from agent.cost_governor import get_governor, current_project_id, estimate_cost_usd, BudgetExceeded
+            pid = current_project_id()
+            if pid:
+                get_governor().check_budget(pid)
+        except BudgetExceeded:
+            raise
+        except Exception:
+            pid = None
+
         response = self._client.messages.create(**anthropic_kwargs)
         assistant_message, finish_reason = normalize_anthropic_response(response)
 
@@ -523,6 +536,14 @@ class _AnthropicCompletionsAdapter:
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
             )
+            # Record spend post-response. Best-effort; any failure here must
+            # not propagate to the caller — the LLM result is already in hand.
+            if pid:
+                try:
+                    cost = estimate_cost_usd(model, prompt_tokens, completion_tokens)
+                    get_governor().record_spend(pid, cost)
+                except Exception:
+                    pass
 
         choice = SimpleNamespace(
             index=0,
