@@ -116,6 +116,47 @@ def _append_log(agent_name: str, entry: Dict[str, Any]) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+REFLECTION_LOG_RETENTION_DAYS = 180
+
+
+def _prune_reflection_log(agent_name: str) -> int:
+    """Drop reflection_log.jsonl entries older than the retention window.
+
+    Returns the number of pruned entries.  Malformed lines and entries
+    without a ``timestamp`` field are retained (fail-open) — we never want
+    pruning to silently destroy rows we can't parse.
+    """
+    path = _reflection_log_path(agent_name)
+    if not path.is_file():
+        return 0
+    cutoff = time.time() - REFLECTION_LOG_RETENTION_DAYS * 86400
+    kept: List[str] = []
+    pruned = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except Exception:
+                kept.append(line.rstrip("\n"))
+                continue
+            ts = entry.get("timestamp")
+            if isinstance(ts, (int, float)) and ts < cutoff:
+                pruned += 1
+                continue
+            kept.append(line.rstrip("\n"))
+    if pruned:
+        # Atomic rewrite via sibling tmp file.
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            for line in kept:
+                f.write(line + "\n")
+        tmp.replace(path)
+    return pruned
+
+
 # ---------------------------------------------------------------------------
 # Data gathering — no LLM call
 # ---------------------------------------------------------------------------
@@ -1024,6 +1065,12 @@ async def run_reflection(
         _propose_unused_skill_deprecation(agent_name, rin.tool_usage)
     except Exception as exc:
         logger.debug("unused skill proposal failed: %s", exc)
+
+    # Prune reflection log entries older than REFLECTION_LOG_RETENTION_DAYS.
+    try:
+        _prune_reflection_log(agent_name)
+    except Exception as exc:
+        logger.debug("reflection log prune failed: %s", exc)
 
     return out
 
