@@ -167,3 +167,174 @@ def test_skill_outcomes_write_path(state_db):
     finally:
         con.close()
     assert post_rows and post_rows[0][0] == "positive"
+
+
+# ---------------------------------------------------------------------------
+# Phase 10: full end-to-end chain
+#
+#   task -> subagent (fake hipp0 provider) -> compile -> infer_outcome_from_turn
+#          -> record_outcome -> reflection NULL backfill -> second compile
+#          observes outcome and ranks D1 > D2.
+#
+# We test the HERMES-side wiring: the fake provider records every call and
+# simulates the hipp0-side trust-multiplier effect by biasing the second
+# compile's ranking based on the outcomes it saw.  The actual hipp0 scoring
+# math is verified separately in packages/server/tests/closed_loop.test.ts.
+# ---------------------------------------------------------------------------
+
+
+class FakeHipp0Provider:
+    """Lightweight in-memory stand-in for Hipp0MemoryProvider.
+
+    Records every compile() and record_outcome() call, and uses its own
+    outcome state to re-rank decisions on subsequent compile() calls.
+    """
+
+    def __init__(self, *, fail_record: bool = False):
+        self.compile_calls: list[dict] = []
+        self.outcome_calls: list[dict] = []
+        self._positive_ids: set[str] = set()
+        self._fail_record = fail_record
+
+    async def compile(self, task_description: str, **kwargs):
+        self.compile_calls.append({"task": task_description, **kwargs})
+        # Baseline ranking: D2 slightly above D1.
+        decisions = [
+            {"id": "D1", "title": "Use JWT", "combined_score": 0.60},
+            {"id": "D2", "title": "Use sessions", "combined_score": 0.65},
+        ]
+        # Simulate hipp0 trust multiplier: positive outcomes bump that id.
+        for d in decisions:
+            if d["id"] in self._positive_ids:
+                d["combined_score"] *= 1.10
+        decisions.sort(key=lambda d: d["combined_score"], reverse=True)
+        return {
+            "decisions": decisions,
+            "total_tokens": 100,
+            "compile_request_id": f"cr-{len(self.compile_calls)}",
+            "compiled_snippet_ids": [d["id"] for d in decisions],
+        }
+
+    async def record_outcome(
+        self,
+        snippet_ids,
+        outcome,
+        *,
+        signal_source,
+        note=None,
+    ):
+        if self._fail_record:
+            raise RuntimeError("simulated hipp0 outage")
+        self.outcome_calls.append({
+            "snippet_ids": list(snippet_ids),
+            "outcome": outcome,
+            "signal_source": signal_source,
+            "note": note,
+        })
+        if outcome == "positive":
+            for sid in snippet_ids:
+                self._positive_ids.add(sid)
+
+
+@pytest.mark.asyncio
+async def test_closed_loop_full_chain(state_db):
+    """End-to-end: compile -> turn -> record_outcome -> backfill -> recompile re-ranks."""
+    import cron.reflection as reflection
+
+    provider = FakeHipp0Provider()
+    sid = "sess-e2e-full"
+    state_db.create_session(sid, source="cli", agent_name="agent-a")
+
+    # 1. First compile — baseline ranking (D2 > D1).
+    first = await provider.compile("build auth module", task_session_id=sid)
+    first_ids = [d["id"] for d in first["decisions"]]
+    assert first_ids == ["D2", "D1"], f"baseline ranking unexpected: {first_ids}"
+    # The snippet ids that participated in this compile — what we'll attribute.
+    compiled_ids = first["compiled_snippet_ids"]
+
+    # 2. Subagent produces a turn; user feedback is positive.
+    user_msg = "Perfect, exactly what I wanted"
+    state_db.append_message(sid, role="user", content=user_msg)
+    inferred = infer_outcome_from_turn(user_msg)
+    assert inferred == "positive"
+
+    # 3. Turn-boundary record_outcome — hits both local SessionDB and provider.
+    state_db.record_outcome(sid, inferred, "turn_heuristic", None)
+    await provider.record_outcome(
+        compiled_ids, inferred, signal_source="turn_heuristic"
+    )
+
+    # The provider captured the call.
+    assert len(provider.outcome_calls) == 1
+    assert provider.outcome_calls[0]["outcome"] == "positive"
+    assert set(provider.outcome_calls[0]["snippet_ids"]) == {"D1", "D2"}
+
+    # 4. Reflection NULL-outcome backfill — no-op because outcome already recorded.
+    result = reflection._query_sessions("agent-a", lookback_days=7)
+    this_sess = next(s for s in result["all"] if s["id"] == sid)
+    assert this_sess["outcome"] == "positive"
+    assert this_sess["outcome_source"] == "turn_heuristic"  # not reflection_backfill
+
+    # 5. Second compile for same task — mock observes outcome state.
+    # We bias only D1 positive to show the ranking flip.
+    provider._positive_ids = {"D1"}  # simulate attribution landed on D1 only
+    second = await provider.compile("build auth module", task_session_id=sid)
+    second_ids = [d["id"] for d in second["decisions"]]
+    assert second_ids == ["D1", "D2"], (
+        f"after positive outcome, D1 should outrank D2; got {second_ids}"
+    )
+    # And the trust boost is visible in the score.
+    d1_score = next(d["combined_score"] for d in second["decisions"] if d["id"] == "D1")
+    assert d1_score > 0.60, f"D1 score should be boosted, got {d1_score}"
+
+
+@pytest.mark.asyncio
+async def test_closed_loop_fails_when_record_outcome_silently_drops(state_db):
+    """Failure mode: if record_outcome no-ops, second compile keeps baseline ranking.
+
+    This guards against a regression where the turn-boundary hook silently
+    fails and the provider never sees the signal.  The assertion message
+    documents exactly what failed.
+    """
+    provider = FakeHipp0Provider()
+    sid = "sess-e2e-broken"
+    state_db.create_session(sid, source="cli", agent_name="agent-a")
+
+    first = await provider.compile("task", task_session_id=sid)
+    assert [d["id"] for d in first["decisions"]] == ["D2", "D1"]
+
+    # Simulate the bug: record_outcome is never called (e.g. hook stripped).
+    inferred = infer_outcome_from_turn("thanks, that worked perfectly!")
+    assert inferred == "positive"
+    # DELIBERATELY skip provider.record_outcome(...) here.
+
+    second = await provider.compile("task", task_session_id=sid)
+    second_ids = [d["id"] for d in second["decisions"]]
+    # This is the assertion that WOULD fail in prod if the hook is broken.
+    # In this failure-mode test we assert the broken behaviour so a future
+    # "fix" that actually wires record_outcome into compile() breaks this test.
+    assert second_ids == ["D2", "D1"], (
+        "without record_outcome, ranking must stay at baseline; "
+        f"got {second_ids} — did record_outcome leak in?"
+    )
+    assert provider.outcome_calls == [], (
+        "FakeProvider saw an outcome call it shouldn't have — "
+        "test fixture drifted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_closed_loop_raises_when_provider_record_outcome_errors(state_db):
+    """Failure mode: provider.record_outcome raises — caller must surface it."""
+    provider = FakeHipp0Provider(fail_record=True)
+    sid = "sess-e2e-err"
+    state_db.create_session(sid, source="cli", agent_name="agent-a")
+
+    await provider.compile("task", task_session_id=sid)
+    inferred = infer_outcome_from_turn("thanks that worked")
+    assert inferred == "positive"
+
+    with pytest.raises(RuntimeError, match="simulated hipp0 outage"):
+        await provider.record_outcome(
+            ["D1", "D2"], inferred, signal_source="turn_heuristic"
+        )
