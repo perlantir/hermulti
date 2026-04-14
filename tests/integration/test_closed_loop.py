@@ -105,3 +105,65 @@ def test_full_closed_loop(state_db):
     # Step 2: reflection picks it up on the next cycle.
     result = reflection._query_sessions("agent-a", lookback_days=7)
     assert any(s["id"] == sid for s in result["positive"])
+
+
+def test_skill_outcomes_write_path(state_db):
+    """Auto-invoke wiring writes baseline + match rows, and the public
+    ``record_skill_outcome_for_session`` hook appends a post row."""
+    import sqlite3
+    import cron.reflection as reflection
+
+    # Seed a prior-week baseline session with a negative outcome on the topic.
+    baseline_sid = "sess-baseline"
+    state_db.create_session(baseline_sid, source="cli", agent_name="agent-a")
+    state_db.append_message(baseline_sid, role="user",
+                            content="the migration broke everything again")
+    state_db.record_outcome(baseline_sid, "negative", "turn_heuristic", None)
+    # Backdate to 2 days ago so it's within the 7d baseline window.
+    old = time.time() - 2 * 86400
+    state_db._conn.execute(
+        "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+        (old, old, baseline_sid),
+    )
+
+    rin = reflection.ReflectionInput(
+        agent_name="agent-a",
+        recent_sessions=[{
+            "id": baseline_sid,
+            "first_user_message": "the migration broke everything again",
+            "outcome": "negative",
+        }],
+        negative_sessions=[{
+            "id": baseline_sid,
+            "first_user_message": "the migration broke everything again",
+        }],
+    )
+    proposal = {"name": "migration-guard", "reason": "prevent breakage"}
+
+    reflection._register_skill_autoinvoke("agent-a", proposal, rin)
+
+    con = sqlite3.connect(str(reflection._state_db_path()))
+    try:
+        rows = con.execute(
+            "SELECT kind, outcome, session_id FROM skill_outcomes "
+            "WHERE skill_id = ? ORDER BY kind", ("migration-guard",),
+        ).fetchall()
+    finally:
+        con.close()
+    kinds = {r[0] for r in rows}
+    assert "baseline" in kinds
+    assert "match" in kinds
+
+    # Public hook appends a post row.
+    reflection.record_skill_outcome_for_session(
+        "migration-guard", "agent-a", baseline_sid, "positive",
+    )
+    con = sqlite3.connect(str(reflection._state_db_path()))
+    try:
+        post_rows = con.execute(
+            "SELECT outcome FROM skill_outcomes "
+            "WHERE skill_id = ? AND kind = 'post'", ("migration-guard",),
+        ).fetchall()
+    finally:
+        con.close()
+    assert post_rows and post_rows[0][0] == "positive"

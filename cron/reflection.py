@@ -572,6 +572,166 @@ def _apply_skill_create(
     return skill_md
 
 
+# ---------------------------------------------------------------------------
+# skill_outcomes A/B baseline + auto-invoke
+# ---------------------------------------------------------------------------
+
+
+def _ensure_skill_outcomes_table(con: sqlite3.Connection) -> None:
+    """Create skill_outcomes table on demand.
+
+    Kept in reflection.py (rather than hermes_state migrations) because it's
+    a reflection-private artifact — it would be dead weight in session DBs
+    for installs that never run reflection.
+    """
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS skill_outcomes (
+               skill_id TEXT NOT NULL,
+               agent_name TEXT NOT NULL,
+               session_id TEXT,
+               outcome TEXT,
+               kind TEXT NOT NULL,
+               ts REAL NOT NULL
+           )"""
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill "
+        "ON skill_outcomes(skill_id, ts)"
+    )
+
+
+def _record_skill_outcome(
+    skill_id: str,
+    agent_name: str,
+    session_id: Optional[str],
+    outcome: Optional[str],
+    kind: str,
+    ts: Optional[float] = None,
+) -> None:
+    """Append a row to skill_outcomes. Best-effort; swallows DB errors."""
+    db_path = _state_db_path()
+    if not db_path.parent.exists():
+        return
+    try:
+        con = sqlite3.connect(str(db_path))
+        try:
+            _ensure_skill_outcomes_table(con)
+            con.execute(
+                "INSERT INTO skill_outcomes "
+                "(skill_id, agent_name, session_id, outcome, kind, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (skill_id, agent_name, session_id, outcome, kind,
+                 ts if ts is not None else time.time()),
+            )
+            con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        logger.debug("skill_outcomes write failed: %s", exc)
+
+
+def _register_skill_autoinvoke(
+    agent_name: str, proposal: Dict[str, Any], rin: ReflectionInput
+) -> None:
+    """Match up to 3 recent sessions to the skill and capture a 7d baseline.
+
+    The scheduler process has no live agent session to inject into, so
+    "auto-invocation" here means wiring the skill into the outcome ledger:
+      1. Baseline: same-topic outcomes in the 7d BEFORE skill creation are
+         written as ``kind='baseline'`` rows.
+      2. Matches: up to 3 recent sessions whose first-user-message contains
+         a topic token are written as ``kind='match'`` rows so the outcome
+         pipeline can later write a ``kind='post'`` row for the delta.
+
+    An A/B summary is appended to the reflection log immediately.
+    """
+    skill_id = re.sub(r"[^a-z0-9]+", "-",
+                      str(proposal.get("name") or "").lower()).strip("-")
+    if not skill_id:
+        return
+    tokens = _skill_topic_tokens(proposal)
+    now = time.time()
+    baseline_cutoff = now - 7 * 86400
+    baseline_outcomes: List[str] = []
+    db_path = _state_db_path()
+    matched_ids: List[str] = []
+    if db_path.exists() and tokens:
+        try:
+            con = sqlite3.connect(str(db_path))
+            con.row_factory = sqlite3.Row
+            try:
+                rows = con.execute(
+                    """SELECT s.id, s.outcome, m.content
+                       FROM sessions s
+                       LEFT JOIN messages m ON m.session_id = s.id
+                                           AND m.role = 'user'
+                       WHERE s.started_at >= ?
+                         AND (s.agent_name = ? OR s.agent_name IS NULL)
+                       ORDER BY s.started_at DESC
+                       LIMIT 500""",
+                    (baseline_cutoff, agent_name),
+                ).fetchall()
+            finally:
+                con.close()
+            seen: set = set()
+            for r in rows:
+                sid = r["id"]
+                if sid in seen:
+                    continue
+                text = (r["content"] or "").lower()
+                if any(tok in text for tok in tokens):
+                    seen.add(sid)
+                    if r["outcome"]:
+                        baseline_outcomes.append(r["outcome"])
+        except sqlite3.Error as exc:
+            logger.debug("skill baseline query failed: %s", exc)
+
+    for oc in baseline_outcomes:
+        _record_skill_outcome(skill_id, agent_name, None, oc, "baseline", now)
+
+    for s in rin.recent_sessions[:50]:
+        text = (s.get("first_user_message") or "").lower()
+        if any(tok in text for tok in tokens):
+            matched_ids.append(s.get("id") or "")
+            _record_skill_outcome(
+                skill_id, agent_name, s.get("id"),
+                s.get("outcome"), "match", now,
+            )
+            if len(matched_ids) >= 3:
+                break
+
+    pos = sum(1 for o in baseline_outcomes if o == "positive")
+    neg = sum(1 for o in baseline_outcomes if o == "negative")
+    _append_log(agent_name, {
+        "action": "skill_autoinvoke_registered",
+        "data": {
+            "skill_id": skill_id,
+            "matched_sessions": matched_ids,
+            "baseline": {
+                "total": len(baseline_outcomes),
+                "positive": pos, "negative": neg,
+                "ratio": (pos / len(baseline_outcomes))
+                         if baseline_outcomes else None,
+            },
+        },
+        "applied": True,
+    })
+
+
+def record_skill_outcome_for_session(
+    skill_id: str,
+    agent_name: str,
+    session_id: str,
+    outcome: str,
+) -> None:
+    """Public hook: called from the outcome-recording pipeline on sessions
+    that were previously registered as a match for ``skill_id``.
+
+    Writes a ``kind='post'`` row so the A/B delta can be computed later.
+    """
+    _record_skill_outcome(skill_id, agent_name, session_id, outcome, "post")
+
+
 async def _capture_cross_agent_observation(
     agent_name: str, obs: Dict[str, Any]
 ) -> bool:
@@ -785,6 +945,13 @@ async def run_reflection(
             "applied": True,
         })
         applied_skills += 1
+        # Auto-invoke wiring: match recent sessions + capture 7d baseline so
+        # subsequent record_outcome calls on matched sessions can be scored
+        # as an A/B delta vs the pre-creation window.
+        try:
+            _register_skill_autoinvoke(agent_name, sp, rin)
+        except Exception as exc:
+            logger.debug("skill auto-invoke wiring failed: %s", exc)
 
     # Cross-agent observations
     if out.overall_confidence >= CONFIDENCE_THRESHOLDS["cross_agent"]:
