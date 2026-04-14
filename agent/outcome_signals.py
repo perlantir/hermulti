@@ -5,7 +5,7 @@ The caller (``run_agent.py`` turn loop, reflection backfill) decides what to do
 with the inferred label — this module only classifies.
 
 Return values match the vocabulary accepted by
-``hermes_state.DecisionDB.record_outcome`` / the hipp0 provider:
+``hermes_state.SessionDB.record_outcome`` / the hipp0 provider:
 ``"positive"``, ``"negative"``, or ``None`` for "no confident signal".
 """
 
