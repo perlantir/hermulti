@@ -300,12 +300,15 @@ async def _try_compile_context(agent_name: str) -> Optional[str]:
         return None
 
 
-def gather_reflection_input(
+async def gather_reflection_input(
     agent_name: str,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     *,
     include_compile: bool = True,
 ) -> ReflectionInput:
+    """Assemble reflection inputs. Native coroutine so the compile-context
+    fetch joins the caller's running loop instead of opening a fresh one
+    (which would crash under gateway concurrency)."""
     sessions = _query_sessions(agent_name, lookback_days)
     tool_usage = _query_tool_usage(agent_name, lookback_days)
     skills = _list_skills(agent_name)
@@ -314,10 +317,9 @@ def gather_reflection_input(
     compiled: Optional[str] = None
     if include_compile:
         try:
-            compiled = asyncio.get_event_loop().run_until_complete(
-                _try_compile_context(agent_name)
-            )
-        except RuntimeError:
+            compiled = await _try_compile_context(agent_name)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("compile fetch failed: %s", exc)
             compiled = None
     return ReflectionInput(
         agent_name=agent_name,
@@ -527,21 +529,7 @@ async def run_reflection(
     Returns a :class:`ReflectionOutput` even on failure (empty fields).
     """
     out = ReflectionOutput()
-    # Gather — synchronous; avoid re-entering the running loop for compile.
-    rin = ReflectionInput(
-        agent_name=agent_name,
-        recent_sessions=[],
-        lookback_days=lookback_days,
-    )
-    sessions = _query_sessions(agent_name, lookback_days)
-    rin.recent_sessions = sessions["all"]
-    rin.positive_sessions = sessions["positive"]
-    rin.negative_sessions = sessions["negative"]
-    rin.tool_usage = _query_tool_usage(agent_name, lookback_days)
-    rin.current_skills = _list_skills(agent_name)
-    rin.memory_snapshot = _read_text_file(_agent_dir(agent_name) / "MEMORY.md", 4000)
-    rin.user_snapshot = _read_text_file(_agent_dir(agent_name) / "USER.md", 2000)
-    rin.compiled_context = await _try_compile_context(agent_name)
+    rin = await gather_reflection_input(agent_name, lookback_days=lookback_days)
 
     if len(rin.recent_sessions) < MIN_SESSIONS_REQUIRED:
         _append_log(agent_name, {
