@@ -45,7 +45,14 @@ CONFIDENCE_THRESHOLDS: Dict[str, float] = {
 }
 
 MAX_MEMORY_PER_CYCLE = 3
-MAX_SKILLS_PER_CYCLE = 0
+# Skills are now auto-creatable (capped at 1/cycle) but only after passing an
+# evidence gate: the candidate must be backed by at least one NEGATIVE-outcome
+# session that mentions a topic token from the proposed skill name within the
+# lookback window.  Without a prior failure to anchor the skill to, we log the
+# proposal as "skill_eval_gate_failed" and skip creation.
+MAX_SKILLS_PER_CYCLE = 1
+# Window (days) searched for prior-negative evidence when scoring a candidate.
+SKILL_EVIDENCE_LOOKBACK_DAYS = 7
 
 AUTO_REFLECTION_TAG = "[auto-reflection]"
 MIN_OVERALL_CONFIDENCE = 0.5
@@ -487,6 +494,84 @@ def _apply_memory_replace(agent_name: str, old: str, new: str) -> Optional[str]:
     return old
 
 
+# ---------------------------------------------------------------------------
+# Skill eval gate + auto-apply
+# ---------------------------------------------------------------------------
+
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _skill_topic_tokens(proposal: Dict[str, Any]) -> List[str]:
+    """Extract lowercase alphanumeric tokens from the skill's name/hint.
+
+    Short stopword-like tokens ( <3 chars ) are dropped so we match on
+    signal-bearing words rather than "to" / "a" / "of".
+    """
+    parts: List[str] = []
+    for key in ("name", "content_hint", "reason"):
+        parts.append(str(proposal.get(key) or ""))
+    text = " ".join(parts).lower().replace("-", " ").replace("_", " ")
+    return [t for t in _WORD_RE.findall(text) if len(t) >= 3]
+
+
+def _score_skill_candidate(
+    agent_name: str,
+    proposal: Dict[str, Any],
+    rin: ReflectionInput,
+) -> Dict[str, Any]:
+    """Require at least one prior NEGATIVE session in the lookback window
+    whose first-user-message contains a topic token from the proposal.
+    """
+    tokens = _skill_topic_tokens(proposal)
+    if not tokens:
+        return {"passed": False, "reason": "no_topic_tokens",
+                "tokens": [], "matches": 0}
+    matches = 0
+    matched_sessions: List[str] = []
+    for s in rin.negative_sessions:
+        text = (s.get("first_user_message") or "").lower()
+        if any(tok in text for tok in tokens):
+            matches += 1
+            matched_sessions.append(s.get("id") or "")
+    passed = matches >= 1
+    return {
+        "passed": passed,
+        "reason": "ok" if passed else "no_prior_negative",
+        "tokens": tokens,
+        "matches": matches,
+        "matched_sessions": matched_sessions[:5],
+        "lookback_days": rin.lookback_days,
+    }
+
+
+def _apply_skill_create(
+    agent_name: str, proposal: Dict[str, Any]
+) -> Optional[Path]:
+    """Create a minimal SKILL.md scaffold. Returns path, or None if the
+    skill already exists or the name is invalid.
+    """
+    raw_name = str(proposal.get("name") or "").strip().lower()
+    name = re.sub(r"[^a-z0-9]+", "-", raw_name).strip("-")
+    if not name:
+        return None
+    skills_dir = _agent_dir(agent_name) / "skills"
+    skill_dir = skills_dir / name
+    skill_md = skill_dir / "SKILL.md"
+    if skill_md.is_file():
+        return None
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    reason = proposal.get("reason") or ""
+    hint = proposal.get("content_hint") or ""
+    body = (
+        f"---\nname: {name}\nsource: auto-reflection\n"
+        f"created_at: {time.time()}\n---\n\n"
+        f"# {name}\n\n{hint}\n\n## Why\n{reason}\n"
+    )
+    skill_md.write_text(body, encoding="utf-8")
+    return skill_md
+
+
 async def _capture_cross_agent_observation(
     agent_name: str, obs: Dict[str, Any]
 ) -> bool:
@@ -654,14 +739,52 @@ async def run_reflection(
                 "applied": False,
             })
 
-    # Skill proposals — log only, never auto-apply
+    # Skill proposals — apply at most MAX_SKILLS_PER_CYCLE, gated by evidence eval.
+    applied_skills = 0
     for sp in out.skill_proposals:
+        action = (sp.get("action") or "create").lower()
+        if action != "create" or applied_skills >= MAX_SKILLS_PER_CYCLE:
+            _append_log(agent_name, {
+                "action": "skill_proposal",
+                "data": sp,
+                "applied": False,
+                "reason": "requires_user_review"
+                          if action != "create" else "skill_cap_reached",
+            })
+            continue
+        evidence = _score_skill_candidate(agent_name, sp, rin)
+        if not evidence.get("passed"):
+            _append_log(agent_name, {
+                "action": "skill_eval_gate_failed",
+                "data": {"proposal": sp, "evidence": evidence},
+                "applied": False,
+            })
+            continue
+        try:
+            created_path = _apply_skill_create(agent_name, sp)
+        except Exception as exc:
+            logger.warning("skill create failed: %s", exc)
+            _append_log(agent_name, {
+                "action": "error",
+                "data": {"proposal": sp, "error": str(exc)},
+                "applied": False,
+            })
+            continue
+        if not created_path:
+            _append_log(agent_name, {
+                "action": "skill_proposal",
+                "data": sp,
+                "applied": False,
+                "reason": "skill_already_exists",
+            })
+            continue
         _append_log(agent_name, {
-            "action": "skill_proposal",
-            "data": sp,
-            "applied": False,
-            "reason": "requires_user_review",
+            "action": "skill_create",
+            "data": {"proposal": sp, "path": str(created_path),
+                     "evidence": evidence},
+            "applied": True,
         })
+        applied_skills += 1
 
     # Cross-agent observations
     if out.overall_confidence >= CONFIDENCE_THRESHOLDS["cross_agent"]:
