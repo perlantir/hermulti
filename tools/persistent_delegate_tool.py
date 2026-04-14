@@ -218,11 +218,42 @@ def classify_task(task_description: str) -> Dict[str, Any]:
     * ``{"namespace": None, "fast_mode": True}`` — default: full
       compile in fast mode, no namespace filter.
 
-    Pure, side-effect-free; safe to unit-test standalone.
+    Uses the similarity-based ``router_classifier`` when available and
+    falls back to the keyword heuristic for short/empty inputs or when
+    the import is missing (import-cycle safety during test collection).
+
+    Also logs the routing decision to ``routing_outcomes`` when a similarity
+    decision was produced, so the feedback edge can learn over time.
+
+    Pure from the caller's perspective; the side-effect is append-only
+    logging to ``~/.hermes/routing_outcomes.jsonl``.
     """
     t = (task_description or "").lower().strip()
     if not t:
         return {"namespace": None, "fast_mode": True}
+
+    try:
+        from tools.router_classifier import classify as _similarity_classify
+        from tools.router_classifier import decision_to_classify_task_hint
+        from tools.routing_outcomes import record_decision
+
+        dec = _similarity_classify(task_description)
+        hint = decision_to_classify_task_hint(dec)
+        # Fire-and-forget log. Any failure must not break the routing path.
+        try:
+            record_decision(
+                task_description,
+                decided_class=dec.cls,
+                score=dec.score,
+                margin=dec.margin,
+                uncertain=dec.uncertain,
+            )
+        except Exception:
+            pass
+        return hint
+    except Exception:
+        # Fallback to the legacy keyword classifier below.
+        pass
 
     # Self-contained heuristic: short tasks with "from scratch" /
     # "hello world" markers and no proper nouns (uppercase words
