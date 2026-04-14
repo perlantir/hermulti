@@ -267,6 +267,54 @@ def _list_skills(agent_name: str) -> List[str]:
     )
 
 
+UNUSED_SKILL_AGE_DAYS = 30
+
+
+def _propose_unused_skill_deprecation(
+    agent_name: str, tool_usage: Dict[str, int]
+) -> None:
+    """Log deprecation proposals (never auto-delete) for skills unused >30d.
+
+    A skill is considered unused when its ``SKILL.md`` mtime is older than
+    ``UNUSED_SKILL_AGE_DAYS`` and no token from the skill name appears as a
+    substring of any recently-used tool name.  Pure log entry — a human
+    reviews the reflection log to prune.
+    """
+    skills_dir = _agent_dir(agent_name) / "skills"
+    if not skills_dir.is_dir():
+        return
+    cutoff = time.time() - UNUSED_SKILL_AGE_DAYS * 86400
+    lowered_tools = [t.lower() for t in tool_usage.keys()]
+    for p in sorted(skills_dir.iterdir()):
+        skill_md = p / "SKILL.md"
+        if not (p.is_dir() and skill_md.is_file()):
+            continue
+        try:
+            mtime = skill_md.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            continue
+        name_tokens = [t for t in _WORD_RE.findall(p.name.lower()) if len(t) >= 3]
+        used = any(
+            any(tok in tool for tok in name_tokens)
+            for tool in lowered_tools
+        )
+        if used:
+            continue
+        _append_log(agent_name, {
+            "action": "skill_deprecation_proposal",
+            "data": {
+                "skill": p.name,
+                "path": str(p),
+                "mtime": mtime,
+                "age_days": (time.time() - mtime) / 86400,
+                "reason": "unused_30d",
+            },
+            "applied": False,
+        })
+
+
 async def _try_compile_context(agent_name: str) -> Optional[str]:
     """Best-effort call to HIPP0 compile for self-improvement context."""
     try:
@@ -970,6 +1018,12 @@ async def run_reflection(
             "data": {"query": q},
             "applied": False,
         })
+
+    # Propose deprecation for skills that haven't been touched / used in 30d.
+    try:
+        _propose_unused_skill_deprecation(agent_name, rin.tool_usage)
+    except Exception as exc:
+        logger.debug("unused skill proposal failed: %s", exc)
 
     return out
 
