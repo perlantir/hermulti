@@ -51,6 +51,10 @@ AUTO_REFLECTION_TAG = "[auto-reflection]"
 MIN_OVERALL_CONFIDENCE = 0.5
 MIN_SESSIONS_REQUIRED = 3
 DEFAULT_LOOKBACK_DAYS = 7
+# Sessions older than this with NULL outcome are backfilled via heuristic
+# before the reflection prompt is built, so stale entries don't sit forever
+# as "no outcome recorded".
+AGED_NULL_OUTCOME_DAYS = 3
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 
@@ -115,6 +119,52 @@ def _state_db_path() -> Path:
     return get_hermes_home() / "state.db"
 
 
+def _backfill_aged_null_outcomes(
+    con: sqlite3.Connection, pool: List[Dict[str, Any]]
+) -> None:
+    """Infer outcomes for aged NULL-outcome sessions and persist them.
+
+    Sessions that ended more than ``AGED_NULL_OUTCOME_DAYS`` days ago without
+    any reaction signal are unlikely to ever receive one. Run the same
+    turn-boundary heuristic over the *last* user message in each such session
+    and, if it yields a confident label, write it back so reflection can use
+    it on future runs. Neutral/unknown cases are left NULL — the reflection
+    prompt already buckets them as "no outcome recorded".
+    """
+    try:
+        from agent.outcome_signals import infer_outcome_from_turn
+    except Exception:
+        return
+    cutoff = time.time() - AGED_NULL_OUTCOME_DAYS * 86400
+    for s in pool:
+        if s.get("outcome"):
+            continue
+        ended = s.get("ended_at") or s.get("started_at") or 0
+        if not ended or ended > cutoff:
+            continue
+        last_user = con.execute(
+            """SELECT content FROM messages
+               WHERE session_id = ? AND role = 'user'
+               ORDER BY timestamp DESC LIMIT 1""",
+            (s["id"],),
+        ).fetchone()
+        text = (last_user["content"] if last_user else "") or ""
+        inferred = infer_outcome_from_turn(text, None, None)
+        if inferred is None:
+            continue
+        try:
+            con.execute(
+                "UPDATE sessions SET outcome = ?, outcome_source = ? "
+                "WHERE id = ? AND outcome IS NULL",
+                (inferred, "reflection_backfill", s["id"]),
+            )
+            con.commit()
+            s["outcome"] = inferred
+            s["outcome_source"] = "reflection_backfill"
+        except sqlite3.Error as exc:
+            logger.debug("NULL-outcome backfill failed for %s: %s", s.get("id"), exc)
+
+
 def _query_sessions(
     agent_name: str,
     lookback_days: int,
@@ -155,6 +205,7 @@ def _query_sessions(
                 (s["id"],),
             ).fetchone()
             s["first_user_message"] = (msg_row["content"] or "")[:200] if msg_row else ""
+        _backfill_aged_null_outcomes(con, pool)
         return {
             "all": pool,
             "positive": [s for s in pool if s.get("outcome") == "positive"],
