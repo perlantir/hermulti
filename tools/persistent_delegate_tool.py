@@ -261,6 +261,85 @@ def _slice_compiled_per_task(
     ]
 
 
+_REDUNDANCY_THRESHOLD = 0.8  # 80% of decisions already present → skip
+
+
+def _drop_redundant_compiled(
+    compiled: "CompiledContext",
+    recent_messages: List[Dict[str, Any]],
+    *,
+    max_chars: int = 16_000,
+) -> "CompiledContext":
+    """Drop compiled decisions already carried by the conversation.
+
+    For each decision, compute token-overlap ratio against the
+    concatenated text of the last few messages. If >= 80% of tokens
+    appear in the conversation, drop it. If >= 80% of ALL decisions
+    are redundant, zero out the decisions list entirely (avoids a
+    nearly-empty compile block whose header adds noise).
+    """
+    if not compiled.decisions:
+        return compiled
+
+    # Join the tail of recent messages into one searchable blob.
+    buf: List[str] = []
+    remaining = max_chars
+    for m in reversed(recent_messages):
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, str) or not content:
+            continue
+        if len(content) > remaining:
+            buf.append(content[-remaining:])
+            break
+        buf.append(content)
+        remaining -= len(content)
+        if remaining <= 0:
+            break
+    convo_tokens = _tokenize(" ".join(buf))
+    if not convo_tokens:
+        return compiled
+
+    kept: List[Dict[str, Any]] = []
+    redundant = 0
+    for d in compiled.decisions:
+        dtoks = _tokenize(str(d.get("text", "")))
+        if not dtoks:
+            kept.append(d)
+            continue
+        overlap = len(dtoks & convo_tokens) / len(dtoks)
+        if overlap >= _REDUNDANCY_THRESHOLD:
+            redundant += 1
+        else:
+            kept.append(d)
+
+    total = len(compiled.decisions)
+    # If overwhelmingly redundant, drop everything.
+    if redundant / total >= _REDUNDANCY_THRESHOLD:
+        kept = []
+
+    if len(kept) == total:
+        return compiled  # nothing dropped; keep identity
+
+    return CompiledContext(
+        decisions=kept,
+        total_tokens=compiled.total_tokens,
+        cache_hit=compiled.cache_hit,
+        role_signal=compiled.role_signal,
+        contrastive_pairs=compiled.contrastive_pairs,
+        degraded=compiled.degraded,
+        degraded_reason=compiled.degraded_reason,
+        decisions_considered=compiled.decisions_considered,
+        decisions_included=len(kept),
+        user_facts=list(compiled.user_facts or []),
+        compilation_time_ms=compiled.compilation_time_ms,
+        token_count=compiled.token_count,
+        raw_response={
+            "skipped_redundant": total - len(kept),
+            "original": compiled.raw_response,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Core tool
 # ---------------------------------------------------------------------------
@@ -312,6 +391,7 @@ class PersistentDelegateTool:
         parent_agent: Optional[Any] = None,
         end_session: bool = False,
         precompiled: Optional[CompiledContext] = None,
+        recent_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> PersistentDelegateResult:
         """Run a persistent delegate end-to-end.
 
@@ -387,6 +467,19 @@ class PersistentDelegateTool:
                     fast_mode=bool(hint.get("fast_mode", True)),
                     namespace=hint.get("namespace"),
                 )
+            # If most compiled content is already present in the
+            # parent's recent messages, skip re-injection to save
+            # tokens + avoid nagging the model with duplicates.
+            effective_recent = recent_messages
+            if effective_recent is None and parent_agent is not None:
+                effective_recent = getattr(
+                    parent_agent, "_session_messages", None
+                )
+            if effective_recent:
+                compiled = _drop_redundant_compiled(
+                    compiled, effective_recent
+                )
+
             system_prompt = self._build_system_prompt(
                 profile, compiled, platform=platform,
             )
