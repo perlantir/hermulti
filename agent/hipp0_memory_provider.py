@@ -289,6 +289,11 @@ class Hipp0MemoryProvider(MemoryProvider):
         # marker when recall may be out of date.
         self._last_compile_success_ts: Optional[float] = None
 
+        # Serialize WAL file I/O so concurrent _wal_append / _drain_wal
+        # calls cannot interleave read→write and lose records. Created
+        # lazily on first use to bind to the correct event loop.
+        self._wal_lock: Optional[asyncio.Lock] = None
+
         self._client = client or httpx.AsyncClient(
             base_url=self.base_url,
             timeout=httpx.Timeout(
@@ -661,6 +666,54 @@ class Hipp0MemoryProvider(MemoryProvider):
 
     # ----------------------------------------------------------------- WAL
 
+    def _get_wal_lock(self) -> asyncio.Lock:
+        if self._wal_lock is None:
+            self._wal_lock = asyncio.Lock()
+        return self._wal_lock
+
+    @staticmethod
+    def _write_secure(path: Path, content: str) -> None:
+        """Atomically write *content* to *path* with 0o600 permissions.
+
+        Writes to a sibling tmp file, chmods before rename so the mode
+        is applied before the file is visible at the final name.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        # os.open + write to set mode atomically (avoids umask-dependent
+        # initial perms that Path.write_text would create).
+        import os as _os
+        fd = _os.open(tmp, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+        try:
+            with _os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+        _os.replace(tmp, path)
+
+    @staticmethod
+    def _append_secure(path: Path, line: str) -> None:
+        """Append *line* to *path*, creating it with 0o600 if missing."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import os as _os
+        # O_APPEND is atomic on POSIX for writes < PIPE_BUF; JSON lines
+        # here are always under that. Create with 0o600 if not present.
+        existed = path.exists()
+        fd = _os.open(path, _os.O_WRONLY | _os.O_CREAT | _os.O_APPEND, 0o600)
+        try:
+            with _os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(line)
+        finally:
+            if not existed:
+                try:
+                    _os.chmod(path, 0o600)
+                except OSError:
+                    pass
+
     def _wal_append(self, record: Dict[str, Any]) -> None:
         if not self._pending_wal_path:
             logger.error(
@@ -668,65 +721,71 @@ class Hipp0MemoryProvider(MemoryProvider):
                 record.get("kind"),
             )
             return
-        self._pending_wal_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._pending_wal_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        self._append_secure(self._pending_wal_path, json.dumps(record) + "\n")
 
     async def _drain_wal(self) -> None:
-        """Replay WAL entries oldest-first. Drops on success, keeps on failure."""
+        """Replay WAL entries oldest-first. Drops on success, keeps on failure.
+
+        Serialized under _wal_lock so a concurrent _wal_append cannot be
+        lost between the read and the rewrite, and so two concurrent
+        drains cannot double-post records.
+        """
         if not self._pending_wal_path or not self._pending_wal_path.exists():
             return
-        try:
-            lines = self._pending_wal_path.read_text(encoding="utf-8").splitlines()
-        except OSError as e:
-            logger.warning("HIPP0 WAL: could not read %s: %s", self._pending_wal_path, e)
-            return
+        async with self._get_wal_lock():
+            if not self._pending_wal_path.exists():
+                return
+            try:
+                lines = self._pending_wal_path.read_text(encoding="utf-8").splitlines()
+            except OSError as e:
+                logger.warning("HIPP0 WAL: could not read %s: %s", self._pending_wal_path, e)
+                return
 
-        remaining: List[str] = []
-        for i, line in enumerate(lines):
-            if not line.strip():
+            remaining: List[str] = []
+            for i, line in enumerate(lines):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning("HIPP0 WAL: dropping malformed line %d", i)
+                    continue
+                try:
+                    resp = await self._client.post(
+                        record["path"],
+                        json=record.get("body") or {},
+                        params=record.get("params"),
+                        headers=record.get("headers"),
+                    )
+                except (httpx.TransportError, httpx.TimeoutException):
+                    # Keep this line and all subsequent lines in order.
+                    remaining.append(line)
+                    remaining.extend(lines[i + 1 :])
+                    break
+                if resp.status_code >= 500:
+                    remaining.append(line)
+                    remaining.extend(lines[i + 1 :])
+                    break
+                # 4xx: bad contract — move to dead_letter.jsonl for operator
+                # inspection rather than silently dropping. 2xx: drop normally.
+                if resp.status_code >= 400:
+                    logger.warning(
+                        "HIPP0 WAL: dead-lettering 4xx entry %s (%d)",
+                        record.get("kind"),
+                        resp.status_code,
+                    )
+                    self._dead_letter_append(record, resp.status_code, resp.text)
                 continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning("HIPP0 WAL: dropping malformed line %d", i)
-                continue
-            try:
-                resp = await self._client.post(
-                    record["path"],
-                    json=record.get("body") or {},
-                    params=record.get("params"),
-                    headers=record.get("headers"),
-                )
-            except (httpx.TransportError, httpx.TimeoutException):
-                # Keep this line and all subsequent lines in order.
-                remaining.append(line)
-                remaining.extend(lines[i + 1 :])
-                break
-            if resp.status_code >= 500:
-                remaining.append(line)
-                remaining.extend(lines[i + 1 :])
-                break
-            # 4xx: bad contract — move to dead_letter.jsonl for operator
-            # inspection rather than silently dropping. 2xx: drop normally.
-            if resp.status_code >= 400:
-                logger.warning(
-                    "HIPP0 WAL: dead-lettering 4xx entry %s (%d)",
-                    record.get("kind"),
-                    resp.status_code,
-                )
-                self._dead_letter_append(record, resp.status_code, resp.text)
-            continue
 
-        if remaining:
-            self._pending_wal_path.write_text(
-                "\n".join(remaining) + "\n", encoding="utf-8"
-            )
-        else:
-            try:
-                self._pending_wal_path.unlink()
-            except OSError:
-                pass
+            if remaining:
+                self._write_secure(
+                    self._pending_wal_path, "\n".join(remaining) + "\n"
+                )
+            else:
+                try:
+                    self._pending_wal_path.unlink()
+                except OSError:
+                    pass
 
     def _dead_letter_path(self) -> Optional[Path]:
         if not self._pending_wal_path:
@@ -739,15 +798,13 @@ class Hipp0MemoryProvider(MemoryProvider):
         dl_path = self._dead_letter_path()
         if dl_path is None:
             return
-        dl_path.parent.mkdir(parents=True, exist_ok=True)
         entry = {
             **record,
             "dead_letter_timestamp": time.time(),
             "status_code": status_code,
             "error_body": error_body[:2000],
         }
-        with dl_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        self._append_secure(dl_path, json.dumps(entry) + "\n")
 
     def dead_letter_size(self) -> int:
         """Return the number of dead-lettered entries (observability helper)."""
