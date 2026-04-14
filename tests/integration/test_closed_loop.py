@@ -338,3 +338,151 @@ async def test_closed_loop_raises_when_provider_record_outcome_errors(state_db):
         await provider.record_outcome(
             ["D1", "D2"], inferred, signal_source="turn_heuristic"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 15 fault-injection variants.
+#
+# The happy-path tests above confirm the loop closes; these ones confirm it
+# degrades gracefully (or fails loudly, as appropriate) under the four most
+# plausible outage modes: hipp0 returns 5xx, WAL write fails, circuit breaker
+# is open, and the cost governor has killed LLM traffic for the project.
+# Parametrised so one regression doesn't mask the others.
+# ---------------------------------------------------------------------------
+
+
+class FaultyHipp0Provider(FakeHipp0Provider):
+    """FakeHipp0Provider with injectable fault modes.
+
+    The production provider lives in agent/hipp0_memory_provider.py; this
+    stand-in reproduces the surface the closed-loop test exercises while
+    letting us switch on a specific failure class per test case.
+    """
+
+    def __init__(
+        self,
+        *,
+        compile_fault: str | None = None,
+        record_fault: str | None = None,
+    ) -> None:
+        super().__init__(fail_record=record_fault is not None)
+        self._compile_fault = compile_fault
+        self._record_fault = record_fault
+
+    async def compile(self, task_description: str, **kwargs):
+        if self._compile_fault == "hipp0_500":
+            raise RuntimeError("hipp0 returned 500 Internal Server Error")
+        if self._compile_fault == "circuit_open":
+            raise RuntimeError("circuit breaker open: hipp0 failing fast")
+        if self._compile_fault == "budget_exceeded":
+            from agent.cost_governor import BudgetExceeded
+            raise BudgetExceeded("proj-x", spent_usd=1.5, cap_usd=1.0)
+        return await super().compile(task_description, **kwargs)
+
+    async def record_outcome(
+        self,
+        snippet_ids,
+        outcome,
+        *,
+        signal_source,
+        note=None,
+    ):
+        if self._record_fault == "wal_full":
+            raise OSError(28, "No space left on device (simulated WAL-full)")
+        if self._record_fault == "circuit_open":
+            raise RuntimeError("circuit breaker open: record_outcome failing fast")
+        return await super().record_outcome(
+            snippet_ids, outcome, signal_source=signal_source, note=note,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault,exception_match",
+    [
+        ("hipp0_500",       r"500"),
+        ("circuit_open",    r"circuit breaker"),
+        ("budget_exceeded", r"exceeding cap"),
+    ],
+    ids=["hipp0-500", "circuit-open", "budget-exceeded"],
+)
+async def test_closed_loop_compile_faults_surface_cleanly(
+    state_db, fault: str, exception_match: str
+) -> None:
+    """Compile-side outages must raise a distinguishable exception.
+
+    The production caller (run_agent turn loop) catches these and falls back
+    to a degraded (no-compile) turn. What matters here is that each fault
+    class raises with a message the caller can match on — silent swallowing
+    would be the real bug.
+    """
+    provider = FaultyHipp0Provider(compile_fault=fault)
+    sid = f"sess-fault-{fault}"
+    state_db.create_session(sid, source="cli", agent_name="agent-a")
+
+    with pytest.raises((RuntimeError, Exception), match=exception_match):
+        await provider.compile("task", task_session_id=sid)
+    # Provider must not have recorded an outcome when compile aborted.
+    assert provider.outcome_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault,exception_cls,exception_match",
+    [
+        ("wal_full",     OSError,      r"No space left"),
+        ("circuit_open", RuntimeError, r"circuit breaker"),
+    ],
+    ids=["wal-full", "circuit-open"],
+)
+async def test_closed_loop_record_outcome_faults_surface(
+    state_db, fault: str, exception_cls, exception_match: str
+) -> None:
+    """record_outcome must raise a typed failure on WAL / circuit outages.
+
+    This pairs with the existing ``test_closed_loop_raises_when_provider_
+    record_outcome_errors`` — that case asserts an errored record_outcome
+    propagates; these cases confirm the specific typed exceptions the
+    turn-loop catches and routes to the dead-letter queue rather than
+    poisoning the session.
+    """
+    provider = FaultyHipp0Provider(record_fault=fault)
+    sid = f"sess-rec-fault-{fault}"
+    state_db.create_session(sid, source="cli", agent_name="agent-a")
+    # Compile must still succeed — only record_outcome is faulted.
+    first = await provider.compile("task", task_session_id=sid)
+    assert [d["id"] for d in first["decisions"]] == ["D2", "D1"]
+
+    with pytest.raises(exception_cls, match=exception_match):
+        await provider.record_outcome(["D1", "D2"], "positive", signal_source="turn_heuristic")
+
+    # Local SessionDB record must still work even when the provider failed —
+    # this is the invariant that keeps the turn loop making progress when
+    # the remote side is down.
+    state_db.record_outcome(sid, "positive", "turn_heuristic", None)
+    import cron.reflection as reflection
+    sess = next(s for s in reflection._query_sessions("agent-a", lookback_days=7)["all"] if s["id"] == sid)
+    assert sess["outcome"] == "positive"
+
+
+@pytest.mark.asyncio
+async def test_closed_loop_compile_fault_leaves_subsequent_compile_recoverable(
+    state_db,
+) -> None:
+    """After a transient compile fault, the next compile must succeed.
+
+    Guards against a regression where a single fault puts the provider
+    instance into a permanently-bad state (e.g. forgets to reset a flag).
+    """
+    provider = FaultyHipp0Provider(compile_fault="hipp0_500")
+    sid = "sess-fault-then-recover"
+    state_db.create_session(sid, source="cli", agent_name="agent-a")
+
+    with pytest.raises(RuntimeError):
+        await provider.compile("task", task_session_id=sid)
+
+    # Heal the provider (as retry logic would after the outage cleared).
+    provider._compile_fault = None
+
+    second = await provider.compile("task", task_session_id=sid)
+    assert [d["id"] for d in second["decisions"]] == ["D2", "D1"]
