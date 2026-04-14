@@ -73,6 +73,10 @@ _CB_FAIL_THRESHOLD = 3
 _CB_WINDOW_SECONDS = 60.0
 _CB_OPEN_SECONDS = 120.0
 
+# Prepend a stale-memory marker to the rendered compile block when the
+# last successful compile is older than this OR the breaker is OPEN.
+_STALE_MEMORY_THRESHOLD_SECONDS = 30 * 60
+
 
 class _CompileCircuitBreaker:
     """Minimal circuit breaker for Hipp0MemoryProvider.compile().
@@ -161,6 +165,9 @@ class CompiledContext:
     compilation_time_ms: int = 0
     token_count: int = 0
     raw_response: Optional[Dict[str, Any]] = None
+    # Minutes since the provider's last successful compile(). Set when
+    # the breaker is OPEN or recall is stale (>30m). None = fresh.
+    stale_minutes: Optional[int] = None
 
     def as_prompt_block(self) -> str:
         """Render the compiled context as a plain-text prompt block.
@@ -176,7 +183,12 @@ class CompiledContext:
         else:
             header = "## Compiled context"
 
-        lines = [header, ""]
+        lines: List[str] = []
+        if self.stale_minutes is not None:
+            lines.append(
+                f"[STALE MEMORY: last successful compile {self.stale_minutes}m ago]"
+            )
+        lines.extend([header, ""])
         if self.decisions:
             for d in self.decisions:
                 text = d.get("text", "")
@@ -785,4 +797,23 @@ class Hipp0MemoryProvider(MemoryProvider):
             cache_hit=False,
             degraded=True,
             degraded_reason=reason,
+            stale_minutes=self._compute_stale_minutes(force=True),
         )
+
+    def _compute_stale_minutes(self, *, force: bool = False) -> Optional[int]:
+        """Return minutes since last successful compile, or None if fresh.
+
+        When ``force`` is True (degraded path, or breaker open) we always
+        emit a staleness number — 999 if nothing has ever succeeded —
+        so callers can render the stale-memory marker. Otherwise we only
+        return a value when the breaker is OPEN or the gap exceeds
+        ``_STALE_MEMORY_THRESHOLD_SECONDS``.
+        """
+        now = time.time()
+        last = self._last_compile_success_ts
+        if last is None:
+            return 999 if force else None
+        gap = now - last
+        if force or self._compile_breaker.state == "OPEN" or gap >= _STALE_MEMORY_THRESHOLD_SECONDS:
+            return max(0, int(gap // 60))
+        return None
