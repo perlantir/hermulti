@@ -37,10 +37,12 @@ without spinning up a real LLM — see
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -131,6 +133,52 @@ class PersistentDelegateError(RuntimeError):
 
 class PersistentDelegateConfigError(PersistentDelegateError):
     """Raised when HIPP0 env / agent config is insufficient to run a delegate."""
+
+
+# ---------------------------------------------------------------------------
+# Compile-result TTL cache — absorbs N-subagent fan-out on the same task.
+# ---------------------------------------------------------------------------
+
+
+_COMPILE_CACHE_TTL_SECONDS = 300.0  # 5 minutes
+_compile_cache: Dict[str, tuple] = {}  # key -> (expires_at, CompiledContext)
+_compile_cache_lock = asyncio.Lock()
+
+
+def _compile_cache_key(
+    project_id: str,
+    task: str,
+    *,
+    fast_mode: bool,
+    namespace: Optional[str],
+) -> str:
+    h = hashlib.sha256(task.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"{project_id}|{h}|{int(fast_mode)}|{namespace or '-'}"
+
+
+async def _compile_cache_get(key: str) -> Optional["CompiledContext"]:
+    async with _compile_cache_lock:
+        entry = _compile_cache.get(key)
+        if entry is None:
+            return None
+        expires_at, compiled = entry
+        if expires_at < time.monotonic():
+            _compile_cache.pop(key, None)
+            return None
+        return compiled
+
+
+async def _compile_cache_put(key: str, compiled: "CompiledContext") -> None:
+    async with _compile_cache_lock:
+        _compile_cache[key] = (
+            time.monotonic() + _COMPILE_CACHE_TTL_SECONDS,
+            compiled,
+        )
+
+
+def _compile_cache_clear() -> None:
+    """Test hook: drop all entries."""
+    _compile_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -462,11 +510,26 @@ class PersistentDelegateTool:
                     raw_response={"skipped": "self_contained_task"},
                 )
             else:
-                compiled = await provider.compile(
-                    task_description=task,
-                    fast_mode=bool(hint.get("fast_mode", True)),
-                    namespace=hint.get("namespace"),
+                fast = bool(hint.get("fast_mode", True))
+                ns = hint.get("namespace")
+                cache_key = _compile_cache_key(
+                    str(profile.config.project_id),
+                    task,
+                    fast_mode=fast,
+                    namespace=ns,
                 )
+                compiled = await _compile_cache_get(cache_key)
+                if compiled is None:
+                    compiled = await provider.compile(
+                        task_description=task,
+                        fast_mode=fast,
+                        namespace=ns,
+                    )
+                    if not compiled.degraded:
+                        # Don't cache degraded results — they're local
+                        # fallbacks, and caching would pin us in the
+                        # degraded state past the 5m window.
+                        await _compile_cache_put(cache_key, compiled)
             # If most compiled content is already present in the
             # parent's recent messages, skip re-injection to save
             # tokens + avoid nagging the model with duplicates.
