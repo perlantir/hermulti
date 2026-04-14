@@ -204,12 +204,23 @@ class CompiledContext:
         # without this block the agent cannot recall cross-agent preferences
         # even though /api/compile returns them in the JSON payload.
         if self.user_facts:
-            lines.append("")
-            lines.append(f"## User Facts ({len(self.user_facts)})")
+            rendered: List[str] = []
             for f in self.user_facts:
-                key = f.get("key") or f.get("fact_key") or "?"
-                value = f.get("value") or f.get("fact_value") or ""
-                lines.append(f"- **{key}**: {value}")
+                # Strict schema: require "key". Log-and-drop malformed
+                # entries so the legacy `fact_key` fallback can't mask a
+                # broken HIPP0 contract.
+                key = f.get("key")
+                if not isinstance(key, str) or not key:
+                    logger.warning(
+                        "HIPP0 user_fact missing 'key'; dropping entry: %r", f
+                    )
+                    continue
+                value = f.get("value", "")
+                rendered.append(f"- **{key}**: {value}")
+            if rendered:
+                lines.append("")
+                lines.append(f"## User Facts ({len(rendered)})")
+                lines.extend(rendered)
         return "\n".join(lines)
 
 
