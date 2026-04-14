@@ -684,14 +684,15 @@ class Hipp0MemoryProvider(MemoryProvider):
                 remaining.append(line)
                 remaining.extend(lines[i + 1 :])
                 break
-            # 4xx or 2xx: drop the entry (4xx means bad contract; there's
-            # no point retrying a malformed request forever).
+            # 4xx: bad contract — move to dead_letter.jsonl for operator
+            # inspection rather than silently dropping. 2xx: drop normally.
             if resp.status_code >= 400:
                 logger.warning(
-                    "HIPP0 WAL: dropping 4xx entry %s on drain (%d)",
+                    "HIPP0 WAL: dead-lettering 4xx entry %s (%d)",
                     record.get("kind"),
                     resp.status_code,
                 )
+                self._dead_letter_append(record, resp.status_code, resp.text)
             continue
 
         if remaining:
@@ -703,6 +704,40 @@ class Hipp0MemoryProvider(MemoryProvider):
                 self._pending_wal_path.unlink()
             except OSError:
                 pass
+
+    def _dead_letter_path(self) -> Optional[Path]:
+        if not self._pending_wal_path:
+            return None
+        return self._pending_wal_path.with_name("dead_letter.jsonl")
+
+    def _dead_letter_append(
+        self, record: Dict[str, Any], status_code: int, error_body: str
+    ) -> None:
+        dl_path = self._dead_letter_path()
+        if dl_path is None:
+            return
+        dl_path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            **record,
+            "dead_letter_timestamp": time.time(),
+            "status_code": status_code,
+            "error_body": error_body[:2000],
+        }
+        with dl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def dead_letter_size(self) -> int:
+        """Return the number of dead-lettered entries (observability helper)."""
+        dl_path = self._dead_letter_path()
+        if not dl_path or not dl_path.exists():
+            return 0
+        try:
+            return sum(
+                1 for line in dl_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+        except OSError:
+            return 0
 
     def wal_size(self) -> int:
         """Return the number of queued WAL entries (test + observability helper)."""
