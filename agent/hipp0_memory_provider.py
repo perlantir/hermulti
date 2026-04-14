@@ -65,6 +65,74 @@ _DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
 _RETRY_ATTEMPTS = 3
 _RETRY_INITIAL_DELAY = 0.4  # seconds; doubles each retry
 
+# Circuit breaker tuning for compile(). Three unavailable events inside
+# a 60s sliding window trips the breaker OPEN for 2 minutes; the next
+# call after cooldown is a HALF_OPEN probe. A success on probe closes
+# the breaker. A failure on probe re-opens it for another 2 minutes.
+_CB_FAIL_THRESHOLD = 3
+_CB_WINDOW_SECONDS = 60.0
+_CB_OPEN_SECONDS = 120.0
+
+
+class _CompileCircuitBreaker:
+    """Minimal circuit breaker for Hipp0MemoryProvider.compile().
+
+    State transitions:
+      CLOSED --(3 timeouts in 60s)--> OPEN
+      OPEN   --(2m elapsed)--------->  HALF_OPEN  (on next call)
+      HALF_OPEN --(success)---------> CLOSED
+      HALF_OPEN --(failure)---------> OPEN (new 2m cooldown)
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_threshold: int = _CB_FAIL_THRESHOLD,
+        window_seconds: float = _CB_WINDOW_SECONDS,
+        open_seconds: float = _CB_OPEN_SECONDS,
+        clock: Optional[Any] = None,
+    ) -> None:
+        self._fail_threshold = fail_threshold
+        self._window = window_seconds
+        self._open_for = open_seconds
+        self._clock = clock or time.monotonic
+        self._failures: List[float] = []
+        self._state: str = "CLOSED"
+        self._opened_at: Optional[float] = None
+
+    @property
+    def state(self) -> str:
+        # Lazy transition OPEN -> HALF_OPEN when cooldown elapsed.
+        if self._state == "OPEN" and self._opened_at is not None:
+            if self._clock() - self._opened_at >= self._open_for:
+                self._state = "HALF_OPEN"
+        return self._state
+
+    def allow(self) -> bool:
+        """Return True if a call should proceed, False if short-circuited."""
+        return self.state != "OPEN"
+
+    def record_success(self) -> None:
+        self._failures.clear()
+        self._state = "CLOSED"
+        self._opened_at = None
+
+    def record_failure(self) -> None:
+        now = self._clock()
+        if self._state == "HALF_OPEN":
+            # Probe failed: re-open for a fresh cooldown.
+            self._state = "OPEN"
+            self._opened_at = now
+            self._failures = [now]
+            return
+        # Trim outside-window failures and append the new one.
+        cutoff = now - self._window
+        self._failures = [t for t in self._failures if t >= cutoff]
+        self._failures.append(now)
+        if len(self._failures) >= self._fail_threshold:
+            self._state = "OPEN"
+            self._opened_at = now
+
 
 # ---------------------------------------------------------------------------
 # Response dataclasses
@@ -191,6 +259,12 @@ class Hipp0MemoryProvider(MemoryProvider):
         self._memory_md_path = Path(memory_md_path) if memory_md_path else None
 
         self._session_id: Optional[str] = None
+
+        self._compile_breaker = _CompileCircuitBreaker()
+        # Wall-clock timestamp of the last successful compile(). Used by
+        # CompiledContext.as_prompt_block() to render a stale-memory
+        # marker when recall may be out of date.
+        self._last_compile_success_ts: Optional[float] = None
 
         self._client = client or httpx.AsyncClient(
             base_url=self.base_url,
@@ -365,6 +439,13 @@ class Hipp0MemoryProvider(MemoryProvider):
                 "explain": "false",
             }
 
+        # Circuit breaker: short-circuit to degraded-mode while OPEN so we
+        # don't pile up doomed requests against a dead HIPP0.
+        if not self._compile_breaker.allow():
+            return self._degraded_compile(
+                f"circuit breaker OPEN (cooldown {int(_CB_OPEN_SECONDS)}s)"
+            )
+
         try:
             data = await self._post_json(
                 "/api/compile",
@@ -374,13 +455,18 @@ class Hipp0MemoryProvider(MemoryProvider):
                 allow_wal=False,  # compile is read; no point queueing
             )
         except Hipp0UnavailableError as e:
+            self._compile_breaker.record_failure()
             return self._degraded_compile(str(e))
         except Hipp0HTTPError as e:
             # 4xx is a hard contract bug — surface it. 5xx fell through
             # to Hipp0UnavailableError via retry.
             if 500 <= e.status_code < 600:
+                self._compile_breaker.record_failure()
                 return self._degraded_compile(str(e))
             raise
+
+        self._compile_breaker.record_success()
+        self._last_compile_success_ts = time.time()
 
         return CompiledContext(
             decisions=list(data.get("decisions") or []),
