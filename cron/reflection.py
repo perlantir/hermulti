@@ -413,7 +413,15 @@ async def gather_reflection_input(
     compiled: Optional[str] = None
     if include_compile:
         try:
-            compiled = await _try_compile_context(agent_name)
+            # 5s ceiling so reflection never blocks on a slow HIPP0.
+            compiled = await asyncio.wait_for(
+                _try_compile_context(agent_name), timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "reflection compile fetch timed out after 5s; proceeding without compiled context"
+            )
+            compiled = None
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("compile fetch failed: %s", exc)
             compiled = None
