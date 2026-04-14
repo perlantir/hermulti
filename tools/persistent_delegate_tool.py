@@ -40,6 +40,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -130,6 +131,74 @@ class PersistentDelegateError(RuntimeError):
 
 class PersistentDelegateConfigError(PersistentDelegateError):
     """Raised when HIPP0 env / agent config is insufficient to run a delegate."""
+
+
+# ---------------------------------------------------------------------------
+# Task classifier — pick the cheapest compile mode for the task.
+# ---------------------------------------------------------------------------
+
+
+_SELF_CONTAINED_PATTERNS = (
+    re.compile(r"\bfrom scratch\b", re.I),
+    re.compile(r"\bhello[\s-]world\b", re.I),
+    re.compile(r"\bwrite\s+a\s+(?:simple|small|trivial|basic)\b", re.I),
+    re.compile(r"\bpure\s+function\b", re.I),
+)
+
+_TECHNICAL_KEYWORDS = (
+    "bug", "error", "fix", "crash", "stack trace", "traceback",
+    "exception", "how to", "debug",
+)
+
+_USER_KEYWORDS = (
+    "preference", "style", "like", "remember", "my ",
+    "i prefer", "i like", "remind me",
+)
+
+
+def classify_task(task_description: str) -> Dict[str, Any]:
+    """Classify a task into a compile-mode hint.
+
+    Returns a dict with one of:
+
+    * ``{"skip_compile": True}`` — self-contained tasks (e.g. "write a
+      hello world from scratch") don't need cross-session memory.
+    * ``{"namespace": "technical", "fast_mode": False}`` — debugging /
+      how-to tasks; use full compile scoped to technical namespace.
+    * ``{"namespace": "user", "fast_mode": True}`` — preference /
+      style / identity tasks; scope to user namespace.
+    * ``{"namespace": None, "fast_mode": True}`` — default: full
+      compile in fast mode, no namespace filter.
+
+    Pure, side-effect-free; safe to unit-test standalone.
+    """
+    t = (task_description or "").lower().strip()
+    if not t:
+        return {"namespace": None, "fast_mode": True}
+
+    # Self-contained heuristic: short tasks with "from scratch" /
+    # "hello world" markers and no proper nouns (uppercase words
+    # mid-sentence) are unlikely to benefit from memory.
+    for pat in _SELF_CONTAINED_PATTERNS:
+        if pat.search(task_description):
+            # Reject if the task mentions proper nouns mid-sentence,
+            # which usually means a project-specific reference.
+            tokens = task_description.split()
+            has_proper_noun = any(
+                i > 0 and tok[:1].isupper() and tok[1:2].islower()
+                for i, tok in enumerate(tokens)
+            )
+            if not has_proper_noun:
+                return {"skip_compile": True}
+            break
+
+    if any(k in t for k in _TECHNICAL_KEYWORDS):
+        return {"namespace": "technical", "fast_mode": False}
+
+    if any(k in t for k in _USER_KEYWORDS):
+        return {"namespace": "user", "fast_mode": True}
+
+    return {"namespace": None, "fast_mode": True}
 
 
 # ---------------------------------------------------------------------------
@@ -233,10 +302,25 @@ class PersistentDelegateTool:
                 user_id=user_id,
                 external_chat_id=external_chat_id,
             )
-            compiled = await provider.compile(
-                task_description=task,
-                fast_mode=True,
-            )
+            hint = classify_task(task)
+            if hint.get("skip_compile"):
+                # Self-contained task: synthesize an empty CompiledContext
+                # rather than round-tripping to HIPP0. Saves one network
+                # call; the degraded flag stays False because this was an
+                # intentional skip, not a failure.
+                compiled = CompiledContext(
+                    decisions=[],
+                    total_tokens=0,
+                    cache_hit=False,
+                    degraded=False,
+                    raw_response={"skipped": "self_contained_task"},
+                )
+            else:
+                compiled = await provider.compile(
+                    task_description=task,
+                    fast_mode=bool(hint.get("fast_mode", True)),
+                    namespace=hint.get("namespace"),
+                )
             system_prompt = self._build_system_prompt(
                 profile, compiled, platform=platform,
             )
