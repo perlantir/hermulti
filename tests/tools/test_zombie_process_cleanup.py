@@ -190,7 +190,7 @@ class TestGatewayCleanupWiring:
     def test_gateway_stop_calls_close(self):
         """gateway stop() should call close() on all running agents."""
         import asyncio
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock, AsyncMock, patch
 
         runner = MagicMock()
         runner._running = True
@@ -201,6 +201,13 @@ class TestGatewayCleanupWiring:
         runner._pending_approvals = {}
         runner._shutdown_event = asyncio.Event()
         runner._exit_reason = None
+        runner._stop_task = None
+        runner._restart_requested = False
+        runner._draining = False
+        runner._restart_drain_timeout = 1.0
+        runner._running_agent_count = lambda: 0
+        runner._exit_code = 0
+        runner._update_runtime_status = MagicMock()
 
         mock_agent_1 = MagicMock()
         mock_agent_2 = MagicMock()
@@ -208,6 +215,17 @@ class TestGatewayCleanupWiring:
             "session-1": mock_agent_1,
             "session-2": mock_agent_2,
         }
+        # _drain_active_agents returns the snapshot that stop() will hand off
+        # to _finalize_shutdown_agents; the finalize routine calls .close() on
+        # each entry.
+        runner._drain_active_agents = AsyncMock(
+            return_value=({"session-1": mock_agent_1, "session-2": mock_agent_2}, False)
+        )
+
+        # Route the real _finalize_shutdown_agents through the MagicMock runner so
+        # agent.close() actually fires (MagicMock would otherwise no-op).
+        from gateway.run import GatewayRunner as _GR
+        runner._finalize_shutdown_agents = lambda active: _GR._finalize_shutdown_agents(runner, active)
 
         from gateway.run import GatewayRunner
 
