@@ -812,6 +812,20 @@ class MatrixAdapter(BasePlatformAdapter):
         while not self._closing:
             try:
                 sync_data = await self._client.sync(timeout=30000)
+
+                # nio returns a SyncError object on permanent auth/permission
+                # failures. Detect this and stop the loop instead of spinning.
+                try:
+                    from nio import SyncError as _NioSyncError  # type: ignore
+                except Exception:
+                    _NioSyncError = None  # type: ignore[assignment]
+                if _NioSyncError is not None and isinstance(sync_data, _NioSyncError):
+                    msg = str(getattr(sync_data, "message", sync_data) or "")
+                    logger.error(
+                        "Matrix: sync returned SyncError: %s - stopping sync", msg
+                    )
+                    return
+
                 if isinstance(sync_data, dict):
                     # Update joined rooms from sync response.
                     rooms_join = sync_data.get("rooms", {}).get("join", {})
