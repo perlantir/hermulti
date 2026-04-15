@@ -10079,7 +10079,15 @@ class AIAgent:
                     if type(_p).__name__ == "Hipp0MemoryProvider":
                         _hipp0_provider = _p
                         break
-            if final_response and _hipp0_provider:
+            _dispatcher = self._get_skill_dispatcher(_hipp0_provider)
+            if final_response and _dispatcher is not None:
+                from agent.skills.matcher import EventType, SkillEvent
+                asyncio.create_task(_dispatcher.dispatch(SkillEvent(
+                    type=EventType.OUTBOUND_MESSAGE,
+                    text=final_response,
+                    metadata={'session_id': getattr(self, 'session_id', None)},
+                )))
+            elif final_response and _hipp0_provider:
                 from agent.outcome_signals import extract_decision_signals
                 decision_signals = extract_decision_signals(final_response, agent_name=self._agent_name)
                 for sig in decision_signals:
@@ -10096,6 +10104,36 @@ class AIAgent:
             pass
 
         return result
+
+    def _get_skill_dispatcher(self, hipp0_provider=None):
+        """Lazy-init SkillDispatcher. Returns None if disabled or no LLM."""
+        if hasattr(self, '_skill_dispatcher_inited'):
+            return self._skill_dispatcher
+        self._skill_dispatcher_inited = True
+        self._skill_dispatcher = None
+        try:
+            from agent.skills.dispatcher import SkillDispatcher
+            from agent.skills.llm_adapter import build_skill_llm_client
+            hp = hipp0_provider
+            if hp is None:
+                hp = getattr(self, 'hipp0_provider', None)
+            if hp is None and getattr(self, '_memory_manager', None) is not None:
+                for p in getattr(self._memory_manager, 'providers', []) or []:
+                    if type(p).__name__ == 'Hipp0MemoryProvider':
+                        hp = p
+                        break
+            llm = build_skill_llm_client()
+            dispatcher = SkillDispatcher(
+                llm_client=llm,
+                hipp0_provider=hp,
+                agent_name=getattr(self, '_agent_name', 'hermes'),
+            )
+            if dispatcher.enabled:
+                self._skill_dispatcher = dispatcher
+        except Exception as exc:
+            logger.debug('[skill-dispatcher] init failed: %s', exc)
+            self._skill_dispatcher = None
+        return self._skill_dispatcher
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
