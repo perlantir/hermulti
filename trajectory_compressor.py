@@ -430,7 +430,8 @@ class TrajectoryCompressor:
             return len(self.tokenizer.encode(text))
         except Exception:
             # Fallback to character estimate
-            return len(text) // 4
+            from agent.model_metadata import estimate_tokens_rough
+            return estimate_tokens_rough(text)
     
     def count_trajectory_tokens(self, trajectory: List[Dict[str, str]]) -> int:
         """Count total tokens in a trajectory."""
@@ -919,6 +920,34 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         
         return result, metrics
     
+    # Cap on simultaneous per-entry compressions when callers use the
+    # ``compress_many_async`` batch helper.  Bounds outbound API fan-out
+    # independently of ``max_concurrent_requests`` (which governs the
+    # whole-directory pipeline) so ad-hoc batch callers don't accidentally
+    # spawn hundreds of concurrent LLM calls.
+    _BATCH_CONCURRENCY = 10
+
+    async def compress_many_async(
+        self,
+        entries: List[Dict[str, Any]],
+    ) -> List[Tuple[Dict[str, Any], "TrajectoryMetrics"]]:
+        """Compress many trajectory entries concurrently, order-preserving.
+
+        Uses ``asyncio.gather`` with an ``asyncio.Semaphore(10)`` so at most
+        10 LLM summarization calls run at once.  Results are returned in the
+        same order as *entries*.
+        """
+        if not entries:
+            return []
+
+        semaphore = asyncio.Semaphore(self._BATCH_CONCURRENCY)
+
+        async def _run_one(entry: Dict[str, Any]):
+            async with semaphore:
+                return await self.process_entry_async(entry)
+
+        return await asyncio.gather(*(_run_one(e) for e in entries))
+
     def process_directory(self, input_dir: Path, output_dir: Path):
         """
         Process all JSONL files in a directory using async parallel processing.

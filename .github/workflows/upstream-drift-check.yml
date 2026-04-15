@@ -1,0 +1,106 @@
+name: Upstream drift check
+
+# Runs on the 1st of every month — a compromise between the quarterly
+# cadence in project_hermulti_upstream_sync.md and monthly visibility into
+# fast-moving upstream work. Also runnable on demand via workflow_dispatch.
+on:
+  schedule:
+    - cron: '0 12 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout hermulti
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git || true
+          git fetch upstream --depth=200
+
+      - name: Measure drift from seed
+        id: drift
+        run: |
+          # Seed commit is documented in memory/project_hermulti_upstream_sync.md
+          # and pinned here. When we do an upstream reseed, bump this to the
+          # new ancestor and reset the issue-worthy threshold.
+          SEED=0493bc7
+
+          COMMITS_AHEAD=$(git log "$SEED..upstream/main" --oneline 2>/dev/null | wc -l | tr -d ' ')
+          SHORTSTAT=$(git diff --shortstat "$SEED" upstream/main 2>/dev/null || echo "compare failed")
+          RECENT=$(git log "$SEED..upstream/main" --oneline 2>/dev/null | head -20)
+
+          echo "commits_ahead=$COMMITS_AHEAD" >> "$GITHUB_OUTPUT"
+          {
+            echo "shortstat<<EOF"
+            echo "$SHORTSTAT"
+            echo "EOF"
+            echo "recent<<EOF"
+            echo "$RECENT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Upstream is ${COMMITS_AHEAD} commits ahead of seed ${SEED}."
+          echo "Diff shortstat: $SHORTSTAT"
+
+      - name: Open issue if drift exceeds threshold
+        if: ${{ fromJSON(steps.drift.outputs.commits_ahead) > 50 }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commitsAhead = ${{ steps.drift.outputs.commits_ahead }};
+            const shortstat = `${{ steps.drift.outputs.shortstat }}`;
+            const recent = `${{ steps.drift.outputs.recent }}`;
+            const title = `Upstream drift: ${commitsAhead} commits from NousResearch/hermes-agent`;
+            const body = [
+              `The monthly drift check found ${commitsAhead} upstream commits since the`,
+              `hermulti seed that have not been merged in.`,
+              ``,
+              `**Diff shortstat (seed..upstream/main):**`,
+              '```',
+              shortstat.trim(),
+              '```',
+              ``,
+              `**Most recent upstream commits:**`,
+              '```',
+              recent.trim(),
+              '```',
+              ``,
+              `See ``memory/project_hermulti_upstream_sync.md`` for the merge strategy`,
+              `— the 4 hazard files (``gateway/run.py``, ``cli.py``, ``run_agent.py``,`,
+              '``hermes_cli/main.py``) need hand review before any 3-way reapply.',
+              ``,
+              `This issue is opened automatically by``.github/workflows/upstream-drift-check.yml``.`,
+            ].join('\n');
+
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-drift',
+              per_page: 1,
+            });
+            if (existing.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing[0].number,
+                body: `Re-check on ${new Date().toISOString().slice(0,10)}: still ${commitsAhead} commits ahead.\n\n${body}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['upstream-drift', 'maintenance'],
+              });
+            }

@@ -32,7 +32,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from hermes_cli.agent_registry import (
     AgentNotFoundError,

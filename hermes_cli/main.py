@@ -5053,6 +5053,25 @@ For more help on a command:
     memory_parser.set_defaults(func=cmd_memory)
 
     # =========================================================================
+    # wal command — inspect HIPP0 provider WAL + dead-letter queues
+    # =========================================================================
+    wal_parser = subparsers.add_parser(
+        "wal",
+        help="Inspect HIPP0 provider WAL and dead-letter queues",
+    )
+    wal_sub = wal_parser.add_subparsers(dest="wal_command")
+    wal_sub.add_parser("status", help="Show WAL depth + dead-letter depth + oldest entry age")
+
+    def cmd_wal(args):
+        sub = getattr(args, "wal_command", None)
+        if sub == "status" or sub is None:
+            from hermes_cli.wal import wal_status
+            return wal_status()
+        return 0
+
+    wal_parser.set_defaults(func=cmd_wal)
+
+    # =========================================================================
     # tools command
     # =========================================================================
     tools_parser = subparsers.add_parser(

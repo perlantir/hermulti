@@ -457,7 +457,8 @@ def _estimate_tokens(content: str) -> int:
     Returns:
         Estimated token count
     """
-    return len(content) // 4
+    from agent.model_metadata import estimate_tokens_rough
+    return estimate_tokens_rough(content)
 
 
 def _parse_tags(tags_value) -> List[str]:

@@ -45,12 +45,23 @@ CONFIDENCE_THRESHOLDS: Dict[str, float] = {
 }
 
 MAX_MEMORY_PER_CYCLE = 3
-MAX_SKILLS_PER_CYCLE = 0
+# Skills are now auto-creatable (capped at 1/cycle) but only after passing an
+# evidence gate: the candidate must be backed by at least one NEGATIVE-outcome
+# session that mentions a topic token from the proposed skill name within the
+# lookback window.  Without a prior failure to anchor the skill to, we log the
+# proposal as "skill_eval_gate_failed" and skip creation.
+MAX_SKILLS_PER_CYCLE = 1
+# Window (days) searched for prior-negative evidence when scoring a candidate.
+SKILL_EVIDENCE_LOOKBACK_DAYS = 7
 
 AUTO_REFLECTION_TAG = "[auto-reflection]"
 MIN_OVERALL_CONFIDENCE = 0.5
 MIN_SESSIONS_REQUIRED = 3
 DEFAULT_LOOKBACK_DAYS = 7
+# Sessions older than this with NULL outcome are backfilled via heuristic
+# before the reflection prompt is built, so stale entries don't sit forever
+# as "no outcome recorded".
+AGED_NULL_OUTCOME_DAYS = 3
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 
@@ -105,6 +116,47 @@ def _append_log(agent_name: str, entry: Dict[str, Any]) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+REFLECTION_LOG_RETENTION_DAYS = 180
+
+
+def _prune_reflection_log(agent_name: str) -> int:
+    """Drop reflection_log.jsonl entries older than the retention window.
+
+    Returns the number of pruned entries.  Malformed lines and entries
+    without a ``timestamp`` field are retained (fail-open) — we never want
+    pruning to silently destroy rows we can't parse.
+    """
+    path = _reflection_log_path(agent_name)
+    if not path.is_file():
+        return 0
+    cutoff = time.time() - REFLECTION_LOG_RETENTION_DAYS * 86400
+    kept: List[str] = []
+    pruned = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except Exception:
+                kept.append(line.rstrip("\n"))
+                continue
+            ts = entry.get("timestamp")
+            if isinstance(ts, (int, float)) and ts < cutoff:
+                pruned += 1
+                continue
+            kept.append(line.rstrip("\n"))
+    if pruned:
+        # Atomic rewrite via sibling tmp file.
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            for line in kept:
+                f.write(line + "\n")
+        tmp.replace(path)
+    return pruned
+
+
 # ---------------------------------------------------------------------------
 # Data gathering — no LLM call
 # ---------------------------------------------------------------------------
@@ -113,6 +165,52 @@ def _append_log(agent_name: str, entry: Dict[str, Any]) -> None:
 def _state_db_path() -> Path:
     from hermes_constants import get_hermes_home
     return get_hermes_home() / "state.db"
+
+
+def _backfill_aged_null_outcomes(
+    con: sqlite3.Connection, pool: List[Dict[str, Any]]
+) -> None:
+    """Infer outcomes for aged NULL-outcome sessions and persist them.
+
+    Sessions that ended more than ``AGED_NULL_OUTCOME_DAYS`` days ago without
+    any reaction signal are unlikely to ever receive one. Run the same
+    turn-boundary heuristic over the *last* user message in each such session
+    and, if it yields a confident label, write it back so reflection can use
+    it on future runs. Neutral/unknown cases are left NULL — the reflection
+    prompt already buckets them as "no outcome recorded".
+    """
+    try:
+        from agent.outcome_signals import infer_outcome_from_turn
+    except Exception:
+        return
+    cutoff = time.time() - AGED_NULL_OUTCOME_DAYS * 86400
+    for s in pool:
+        if s.get("outcome"):
+            continue
+        ended = s.get("ended_at") or s.get("started_at") or 0
+        if not ended or ended > cutoff:
+            continue
+        last_user = con.execute(
+            """SELECT content FROM messages
+               WHERE session_id = ? AND role = 'user'
+               ORDER BY timestamp DESC LIMIT 1""",
+            (s["id"],),
+        ).fetchone()
+        text = (last_user["content"] if last_user else "") or ""
+        inferred = infer_outcome_from_turn(text, None, None)
+        if inferred is None:
+            continue
+        try:
+            con.execute(
+                "UPDATE sessions SET outcome = ?, outcome_source = ? "
+                "WHERE id = ? AND outcome IS NULL",
+                (inferred, "reflection_backfill", s["id"]),
+            )
+            con.commit()
+            s["outcome"] = inferred
+            s["outcome_source"] = "reflection_backfill"
+        except sqlite3.Error as exc:
+            logger.debug("NULL-outcome backfill failed for %s: %s", s.get("id"), exc)
 
 
 def _query_sessions(
@@ -155,6 +253,7 @@ def _query_sessions(
                 (s["id"],),
             ).fetchone()
             s["first_user_message"] = (msg_row["content"] or "")[:200] if msg_row else ""
+        _backfill_aged_null_outcomes(con, pool)
         return {
             "all": pool,
             "positive": [s for s in pool if s.get("outcome") == "positive"],
@@ -209,6 +308,54 @@ def _list_skills(agent_name: str) -> List[str]:
     )
 
 
+UNUSED_SKILL_AGE_DAYS = 30
+
+
+def _propose_unused_skill_deprecation(
+    agent_name: str, tool_usage: Dict[str, int]
+) -> None:
+    """Log deprecation proposals (never auto-delete) for skills unused >30d.
+
+    A skill is considered unused when its ``SKILL.md`` mtime is older than
+    ``UNUSED_SKILL_AGE_DAYS`` and no token from the skill name appears as a
+    substring of any recently-used tool name.  Pure log entry — a human
+    reviews the reflection log to prune.
+    """
+    skills_dir = _agent_dir(agent_name) / "skills"
+    if not skills_dir.is_dir():
+        return
+    cutoff = time.time() - UNUSED_SKILL_AGE_DAYS * 86400
+    lowered_tools = [t.lower() for t in tool_usage.keys()]
+    for p in sorted(skills_dir.iterdir()):
+        skill_md = p / "SKILL.md"
+        if not (p.is_dir() and skill_md.is_file()):
+            continue
+        try:
+            mtime = skill_md.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            continue
+        name_tokens = [t for t in _WORD_RE.findall(p.name.lower()) if len(t) >= 3]
+        used = any(
+            any(tok in tool for tok in name_tokens)
+            for tool in lowered_tools
+        )
+        if used:
+            continue
+        _append_log(agent_name, {
+            "action": "skill_deprecation_proposal",
+            "data": {
+                "skill": p.name,
+                "path": str(p),
+                "mtime": mtime,
+                "age_days": (time.time() - mtime) / 86400,
+                "reason": "unused_30d",
+            },
+            "applied": False,
+        })
+
+
 async def _try_compile_context(agent_name: str) -> Optional[str]:
     """Best-effort call to HIPP0 compile for self-improvement context."""
     try:
@@ -249,12 +396,15 @@ async def _try_compile_context(agent_name: str) -> Optional[str]:
         return None
 
 
-def gather_reflection_input(
+async def gather_reflection_input(
     agent_name: str,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     *,
     include_compile: bool = True,
 ) -> ReflectionInput:
+    """Assemble reflection inputs. Native coroutine so the compile-context
+    fetch joins the caller's running loop instead of opening a fresh one
+    (which would crash under gateway concurrency)."""
     sessions = _query_sessions(agent_name, lookback_days)
     tool_usage = _query_tool_usage(agent_name, lookback_days)
     skills = _list_skills(agent_name)
@@ -263,10 +413,17 @@ def gather_reflection_input(
     compiled: Optional[str] = None
     if include_compile:
         try:
-            compiled = asyncio.get_event_loop().run_until_complete(
-                _try_compile_context(agent_name)
+            # 5s ceiling so reflection never blocks on a slow HIPP0.
+            compiled = await asyncio.wait_for(
+                _try_compile_context(agent_name), timeout=5.0
             )
-        except RuntimeError:
+        except asyncio.TimeoutError:
+            logger.warning(
+                "reflection compile fetch timed out after 5s; proceeding without compiled context"
+            )
+            compiled = None
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("compile fetch failed: %s", exc)
             compiled = None
     return ReflectionInput(
         agent_name=agent_name,
@@ -434,6 +591,244 @@ def _apply_memory_replace(agent_name: str, old: str, new: str) -> Optional[str]:
     return old
 
 
+# ---------------------------------------------------------------------------
+# Skill eval gate + auto-apply
+# ---------------------------------------------------------------------------
+
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _skill_topic_tokens(proposal: Dict[str, Any]) -> List[str]:
+    """Extract lowercase alphanumeric tokens from the skill's name/hint.
+
+    Short stopword-like tokens ( <3 chars ) are dropped so we match on
+    signal-bearing words rather than "to" / "a" / "of".
+    """
+    parts: List[str] = []
+    for key in ("name", "content_hint", "reason"):
+        parts.append(str(proposal.get(key) or ""))
+    text = " ".join(parts).lower().replace("-", " ").replace("_", " ")
+    return [t for t in _WORD_RE.findall(text) if len(t) >= 3]
+
+
+def _score_skill_candidate(
+    agent_name: str,
+    proposal: Dict[str, Any],
+    rin: ReflectionInput,
+) -> Dict[str, Any]:
+    """Require at least one prior NEGATIVE session in the lookback window
+    whose first-user-message contains a topic token from the proposal.
+    """
+    tokens = _skill_topic_tokens(proposal)
+    if not tokens:
+        return {"passed": False, "reason": "no_topic_tokens",
+                "tokens": [], "matches": 0}
+    matches = 0
+    matched_sessions: List[str] = []
+    for s in rin.negative_sessions:
+        text = (s.get("first_user_message") or "").lower()
+        if any(tok in text for tok in tokens):
+            matches += 1
+            matched_sessions.append(s.get("id") or "")
+    passed = matches >= 1
+    return {
+        "passed": passed,
+        "reason": "ok" if passed else "no_prior_negative",
+        "tokens": tokens,
+        "matches": matches,
+        "matched_sessions": matched_sessions[:5],
+        "lookback_days": rin.lookback_days,
+    }
+
+
+def _apply_skill_create(
+    agent_name: str, proposal: Dict[str, Any]
+) -> Optional[Path]:
+    """Create a minimal SKILL.md scaffold. Returns path, or None if the
+    skill already exists or the name is invalid.
+    """
+    raw_name = str(proposal.get("name") or "").strip().lower()
+    name = re.sub(r"[^a-z0-9]+", "-", raw_name).strip("-")
+    if not name:
+        return None
+    skills_dir = _agent_dir(agent_name) / "skills"
+    skill_dir = skills_dir / name
+    skill_md = skill_dir / "SKILL.md"
+    if skill_md.is_file():
+        return None
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    reason = proposal.get("reason") or ""
+    hint = proposal.get("content_hint") or ""
+    body = (
+        f"---\nname: {name}\nsource: auto-reflection\n"
+        f"created_at: {time.time()}\n---\n\n"
+        f"# {name}\n\n{hint}\n\n## Why\n{reason}\n"
+    )
+    skill_md.write_text(body, encoding="utf-8")
+    return skill_md
+
+
+# ---------------------------------------------------------------------------
+# skill_outcomes A/B baseline + auto-invoke
+# ---------------------------------------------------------------------------
+
+
+def _ensure_skill_outcomes_table(con: sqlite3.Connection) -> None:
+    """Create skill_outcomes table on demand.
+
+    Kept in reflection.py (rather than hermes_state migrations) because it's
+    a reflection-private artifact — it would be dead weight in session DBs
+    for installs that never run reflection.
+    """
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS skill_outcomes (
+               skill_id TEXT NOT NULL,
+               agent_name TEXT NOT NULL,
+               session_id TEXT,
+               outcome TEXT,
+               kind TEXT NOT NULL,
+               ts REAL NOT NULL
+           )"""
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_outcomes_skill "
+        "ON skill_outcomes(skill_id, ts)"
+    )
+
+
+def _record_skill_outcome(
+    skill_id: str,
+    agent_name: str,
+    session_id: Optional[str],
+    outcome: Optional[str],
+    kind: str,
+    ts: Optional[float] = None,
+) -> None:
+    """Append a row to skill_outcomes. Best-effort; swallows DB errors."""
+    db_path = _state_db_path()
+    if not db_path.parent.exists():
+        return
+    try:
+        con = sqlite3.connect(str(db_path))
+        try:
+            _ensure_skill_outcomes_table(con)
+            con.execute(
+                "INSERT INTO skill_outcomes "
+                "(skill_id, agent_name, session_id, outcome, kind, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (skill_id, agent_name, session_id, outcome, kind,
+                 ts if ts is not None else time.time()),
+            )
+            con.commit()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        logger.debug("skill_outcomes write failed: %s", exc)
+
+
+def _register_skill_autoinvoke(
+    agent_name: str, proposal: Dict[str, Any], rin: ReflectionInput
+) -> None:
+    """Match up to 3 recent sessions to the skill and capture a 7d baseline.
+
+    The scheduler process has no live agent session to inject into, so
+    "auto-invocation" here means wiring the skill into the outcome ledger:
+      1. Baseline: same-topic outcomes in the 7d BEFORE skill creation are
+         written as ``kind='baseline'`` rows.
+      2. Matches: up to 3 recent sessions whose first-user-message contains
+         a topic token are written as ``kind='match'`` rows so the outcome
+         pipeline can later write a ``kind='post'`` row for the delta.
+
+    An A/B summary is appended to the reflection log immediately.
+    """
+    skill_id = re.sub(r"[^a-z0-9]+", "-",
+                      str(proposal.get("name") or "").lower()).strip("-")
+    if not skill_id:
+        return
+    tokens = _skill_topic_tokens(proposal)
+    now = time.time()
+    baseline_cutoff = now - 7 * 86400
+    baseline_outcomes: List[str] = []
+    db_path = _state_db_path()
+    matched_ids: List[str] = []
+    if db_path.exists() and tokens:
+        try:
+            con = sqlite3.connect(str(db_path))
+            con.row_factory = sqlite3.Row
+            try:
+                rows = con.execute(
+                    """SELECT s.id, s.outcome, m.content
+                       FROM sessions s
+                       LEFT JOIN messages m ON m.session_id = s.id
+                                           AND m.role = 'user'
+                       WHERE s.started_at >= ?
+                         AND (s.agent_name = ? OR s.agent_name IS NULL)
+                       ORDER BY s.started_at DESC
+                       LIMIT 500""",
+                    (baseline_cutoff, agent_name),
+                ).fetchall()
+            finally:
+                con.close()
+            seen: set = set()
+            for r in rows:
+                sid = r["id"]
+                if sid in seen:
+                    continue
+                text = (r["content"] or "").lower()
+                if any(tok in text for tok in tokens):
+                    seen.add(sid)
+                    if r["outcome"]:
+                        baseline_outcomes.append(r["outcome"])
+        except sqlite3.Error as exc:
+            logger.debug("skill baseline query failed: %s", exc)
+
+    for oc in baseline_outcomes:
+        _record_skill_outcome(skill_id, agent_name, None, oc, "baseline", now)
+
+    for s in rin.recent_sessions[:50]:
+        text = (s.get("first_user_message") or "").lower()
+        if any(tok in text for tok in tokens):
+            matched_ids.append(s.get("id") or "")
+            _record_skill_outcome(
+                skill_id, agent_name, s.get("id"),
+                s.get("outcome"), "match", now,
+            )
+            if len(matched_ids) >= 3:
+                break
+
+    pos = sum(1 for o in baseline_outcomes if o == "positive")
+    neg = sum(1 for o in baseline_outcomes if o == "negative")
+    _append_log(agent_name, {
+        "action": "skill_autoinvoke_registered",
+        "data": {
+            "skill_id": skill_id,
+            "matched_sessions": matched_ids,
+            "baseline": {
+                "total": len(baseline_outcomes),
+                "positive": pos, "negative": neg,
+                "ratio": (pos / len(baseline_outcomes))
+                         if baseline_outcomes else None,
+            },
+        },
+        "applied": True,
+    })
+
+
+def record_skill_outcome_for_session(
+    skill_id: str,
+    agent_name: str,
+    session_id: str,
+    outcome: str,
+) -> None:
+    """Public hook: called from the outcome-recording pipeline on sessions
+    that were previously registered as a match for ``skill_id``.
+
+    Writes a ``kind='post'`` row so the A/B delta can be computed later.
+    """
+    _record_skill_outcome(skill_id, agent_name, session_id, outcome, "post")
+
+
 async def _capture_cross_agent_observation(
     agent_name: str, obs: Dict[str, Any]
 ) -> bool:
@@ -476,21 +871,7 @@ async def run_reflection(
     Returns a :class:`ReflectionOutput` even on failure (empty fields).
     """
     out = ReflectionOutput()
-    # Gather — synchronous; avoid re-entering the running loop for compile.
-    rin = ReflectionInput(
-        agent_name=agent_name,
-        recent_sessions=[],
-        lookback_days=lookback_days,
-    )
-    sessions = _query_sessions(agent_name, lookback_days)
-    rin.recent_sessions = sessions["all"]
-    rin.positive_sessions = sessions["positive"]
-    rin.negative_sessions = sessions["negative"]
-    rin.tool_usage = _query_tool_usage(agent_name, lookback_days)
-    rin.current_skills = _list_skills(agent_name)
-    rin.memory_snapshot = _read_text_file(_agent_dir(agent_name) / "MEMORY.md", 4000)
-    rin.user_snapshot = _read_text_file(_agent_dir(agent_name) / "USER.md", 2000)
-    rin.compiled_context = await _try_compile_context(agent_name)
+    rin = await gather_reflection_input(agent_name, lookback_days=lookback_days)
 
     if len(rin.recent_sessions) < MIN_SESSIONS_REQUIRED:
         _append_log(agent_name, {
@@ -615,14 +996,59 @@ async def run_reflection(
                 "applied": False,
             })
 
-    # Skill proposals — log only, never auto-apply
+    # Skill proposals — apply at most MAX_SKILLS_PER_CYCLE, gated by evidence eval.
+    applied_skills = 0
     for sp in out.skill_proposals:
+        action = (sp.get("action") or "create").lower()
+        if action != "create" or applied_skills >= MAX_SKILLS_PER_CYCLE:
+            _append_log(agent_name, {
+                "action": "skill_proposal",
+                "data": sp,
+                "applied": False,
+                "reason": "requires_user_review"
+                          if action != "create" else "skill_cap_reached",
+            })
+            continue
+        evidence = _score_skill_candidate(agent_name, sp, rin)
+        if not evidence.get("passed"):
+            _append_log(agent_name, {
+                "action": "skill_eval_gate_failed",
+                "data": {"proposal": sp, "evidence": evidence},
+                "applied": False,
+            })
+            continue
+        try:
+            created_path = _apply_skill_create(agent_name, sp)
+        except Exception as exc:
+            logger.warning("skill create failed: %s", exc)
+            _append_log(agent_name, {
+                "action": "error",
+                "data": {"proposal": sp, "error": str(exc)},
+                "applied": False,
+            })
+            continue
+        if not created_path:
+            _append_log(agent_name, {
+                "action": "skill_proposal",
+                "data": sp,
+                "applied": False,
+                "reason": "skill_already_exists",
+            })
+            continue
         _append_log(agent_name, {
-            "action": "skill_proposal",
-            "data": sp,
-            "applied": False,
-            "reason": "requires_user_review",
+            "action": "skill_create",
+            "data": {"proposal": sp, "path": str(created_path),
+                     "evidence": evidence},
+            "applied": True,
         })
+        applied_skills += 1
+        # Auto-invoke wiring: match recent sessions + capture 7d baseline so
+        # subsequent record_outcome calls on matched sessions can be scored
+        # as an A/B delta vs the pre-creation window.
+        try:
+            _register_skill_autoinvoke(agent_name, sp, rin)
+        except Exception as exc:
+            logger.debug("skill auto-invoke wiring failed: %s", exc)
 
     # Cross-agent observations
     if out.overall_confidence >= CONFIDENCE_THRESHOLDS["cross_agent"]:
@@ -641,6 +1067,18 @@ async def run_reflection(
             "data": {"query": q},
             "applied": False,
         })
+
+    # Propose deprecation for skills that haven't been touched / used in 30d.
+    try:
+        _propose_unused_skill_deprecation(agent_name, rin.tool_usage)
+    except Exception as exc:
+        logger.debug("unused skill proposal failed: %s", exc)
+
+    # Prune reflection log entries older than REFLECTION_LOG_RETENTION_DAYS.
+    try:
+        _prune_reflection_log(agent_name)
+    except Exception as exc:
+        logger.debug("reflection log prune failed: %s", exc)
 
     return out
 

@@ -814,10 +814,10 @@ class TestAuxiliaryPoolAwareness:
             patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
             patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="***"),
         ):
-            client, model = get_vision_auxiliary_client()
+            provider, client, model = resolve_vision_provider_client()
 
         assert client is not None
-        assert client.__class__.__name__ == "AnthropicAuxiliaryClient"
+        assert provider == "anthropic"
 
     def test_vision_auto_prefers_active_provider_over_openrouter(self, monkeypatch):
         """Active provider is tried before OpenRouter in vision auto."""

@@ -119,6 +119,13 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     fake_run_agent.AIAgent = FakeAgent
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
+    # Populate the tool registry deterministically before running the agent,
+    # so get_tool_emoji("terminal") resolves the same way regardless of which
+    # tests ran before on this xdist worker.
+    import tools.terminal_tool  # noqa: F401
+    from agent.display import get_tool_emoji
+    expected_emoji = get_tool_emoji("terminal", default="⚙️")
+
     adapter = ProgressCaptureAdapter()
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
@@ -144,7 +151,7 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     assert adapter.sent == [
         {
             "chat_id": "-1001",
-            "content": '⚙️ terminal: "pwd"',
+            "content": f'{expected_emoji} terminal: "pwd"',
             "reply_to": None,
             "metadata": {"thread_id": "17585"},
         }

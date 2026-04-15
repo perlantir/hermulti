@@ -109,7 +109,8 @@ def _count_tokens_for_entry(entry: Dict) -> Tuple[Dict, int]:
                 total += len(_TOKENIZER.encode(value))
             except Exception:
                 # Fallback to character estimate
-                total += len(value) // 4
+                from agent.model_metadata import estimate_tokens_rough
+                total += estimate_tokens_rough(value)
     
     return entry, total
 

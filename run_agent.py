@@ -5584,9 +5584,20 @@ class AIAgent:
         try:
             from tools.vision_tools import vision_analyze_tool
 
-            result_json = asyncio.run(
-                vision_analyze_tool(image_url=vision_source, user_prompt=analysis_prompt)
-            )
+            coro = vision_analyze_tool(image_url=vision_source, user_prompt=analysis_prompt)
+            # Safe for both sync CLI paths (no loop) and gateway threads
+            # where an event loop is already running: nesting asyncio.run()
+            # inside a live loop raises RuntimeError under concurrency.
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop and running_loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    result_json = pool.submit(asyncio.run, coro).result()
+            else:
+                result_json = asyncio.run(coro)
             result = json.loads(result_json) if isinstance(result_json, str) else {}
             description = (result.get("analysis") or "").strip()
         except Exception as e:
@@ -10044,7 +10055,85 @@ class AIAgent:
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
 
+        # Turn-boundary outcome inference.  Most sessions never get an explicit
+        # reaction from gateway/telegram, so the outcome column stays NULL and
+        # reflection has nothing to learn from.  Infer a coarse signal from the
+        # *next* user message's feedback markers when available — fire-and-forget.
+        try:
+            from agent.outcome_signals import infer_outcome_from_turn
+            inferred = infer_outcome_from_turn(
+                original_user_message, final_response, None
+            )
+            if inferred is not None and self._session_db and self.session_id:
+                self._session_db.record_outcome(
+                    self.session_id, inferred, "turn_heuristic", None
+                )
+        except Exception as exc:
+            logger.debug("turn-boundary record_outcome failed: %s", exc)
+
+        # Decision signal capture — passive extraction from assistant's turn text.
+        try:
+            _hipp0_provider = getattr(self, 'hipp0_provider', None)
+            if not _hipp0_provider and self._memory_manager:
+                for _p in self._memory_manager.providers:
+                    if type(_p).__name__ == "Hipp0MemoryProvider":
+                        _hipp0_provider = _p
+                        break
+            _dispatcher = self._get_skill_dispatcher(_hipp0_provider)
+            if final_response and _dispatcher is not None:
+                from agent.skills.matcher import EventType, SkillEvent
+                asyncio.create_task(_dispatcher.dispatch(SkillEvent(
+                    type=EventType.OUTBOUND_MESSAGE,
+                    text=final_response,
+                    metadata={'session_id': getattr(self, 'session_id', None)},
+                )))
+            elif final_response and _hipp0_provider:
+                from agent.outcome_signals import extract_decision_signals
+                decision_signals = extract_decision_signals(final_response, agent_name=self._agent_name)
+                for sig in decision_signals:
+                    asyncio.create_task(
+                        _hipp0_provider.record_decision(
+                            title=sig.title,
+                            rationale=sig.rationale,
+                            tags=sig.tags,
+                            confidence=sig.confidence,
+                            agent_name=self._agent_name,
+                        )
+                    )
+        except Exception:
+            pass
+
         return result
+
+    def _get_skill_dispatcher(self, hipp0_provider=None):
+        """Lazy-init SkillDispatcher. Returns None if disabled or no LLM."""
+        if hasattr(self, '_skill_dispatcher_inited'):
+            return self._skill_dispatcher
+        self._skill_dispatcher_inited = True
+        self._skill_dispatcher = None
+        try:
+            from agent.skills.dispatcher import SkillDispatcher
+            from agent.skills.llm_adapter import build_skill_llm_client
+            hp = hipp0_provider
+            if hp is None:
+                hp = getattr(self, 'hipp0_provider', None)
+            if hp is None and getattr(self, '_memory_manager', None) is not None:
+                for p in getattr(self._memory_manager, 'providers', []) or []:
+                    if type(p).__name__ == 'Hipp0MemoryProvider':
+                        hp = p
+                        break
+            llm = build_skill_llm_client()
+            dispatcher = SkillDispatcher(
+                llm_client=llm,
+                hipp0_provider=hp,
+                agent_name=getattr(self, '_agent_name', 'hermes'),
+            )
+            if dispatcher.enabled:
+                self._skill_dispatcher = dispatcher
+        except Exception as exc:
+            logger.debug('[skill-dispatcher] init failed: %s', exc)
+            self._skill_dispatcher = None
+        return self._skill_dispatcher
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

@@ -153,6 +153,16 @@ class TestLookupModelsDevContext:
 
 
 class TestFetchModelsDev:
+    @pytest.fixture(autouse=True)
+    def _restore_models_dev_cache(self):
+        """Save and restore module-global cache to prevent pollution of other tests."""
+        import agent.models_dev as md
+        saved_cache = md._models_dev_cache
+        saved_time = md._models_dev_cache_time
+        yield
+        md._models_dev_cache = saved_cache
+        md._models_dev_cache_time = saved_time
+
     @patch("agent.models_dev.requests.get")
     def test_fetch_success(self, mock_get):
         mock_resp = MagicMock()

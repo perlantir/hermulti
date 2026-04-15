@@ -33,6 +33,7 @@ def _make_voice_cli(**overrides):
     cli._pending_input = queue.Queue()
     cli._app = None
     cli.console = SimpleNamespace(width=80)
+    cli._attached_images = []
     for k, v in overrides.items():
         setattr(cli, k, v)
     return cli

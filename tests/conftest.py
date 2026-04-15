@@ -119,3 +119,67 @@ def _enforce_test_timeout():
     yield
     signal.alarm(0)
     signal.signal(signal.SIGALRM, old)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_environment():
+    """Snapshot/restore os.environ per test to prevent cross-test pollution under xdist."""
+    saved = os.environ.copy()
+    try:
+        yield
+    finally:
+        # Restore: remove added keys, re-add deleted keys, reset mutated values
+        current_keys = set(os.environ.keys())
+        saved_keys = set(saved.keys())
+        for k in current_keys - saved_keys:
+            os.environ.pop(k, None)
+        for k in saved_keys - current_keys:
+            os.environ[k] = saved[k]
+        for k in saved_keys & current_keys:
+            if os.environ[k] != saved[k]:
+                os.environ[k] = saved[k]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_models_dev_cache():
+    """Snapshot/restore agent.models_dev module-level cache to prevent test pollution.
+
+    Some tests overwrite ``_models_dev_cache`` with a synthetic registry that
+    lacks providers like ``opencode-go``. Without isolation, downstream tests
+    on the same xdist worker observe the polluted cache and fail intermittently.
+    """
+    try:
+        from agent import models_dev as _md
+    except Exception:
+        yield
+        return
+
+    saved_cache = getattr(_md, "_models_dev_cache", None)
+    saved_time = getattr(_md, "_models_dev_cache_time", None)
+    # Shallow-copy the dict so in-place mutations during the test don't bleed
+    # back into the saved snapshot.
+    if isinstance(saved_cache, dict):
+        saved_cache = dict(saved_cache)
+    try:
+        yield
+    finally:
+        if hasattr(_md, "_models_dev_cache"):
+            _md._models_dev_cache = saved_cache
+        if hasattr(_md, "_models_dev_cache_time"):
+            _md._models_dev_cache_time = saved_time
+
+
+def pytest_configure(config):
+    """Eagerly import tool modules so the global registry is populated regardless
+    of which tests run on a given xdist worker. Without this, tests like
+    test_terminal_tool_present fail when scheduled on a worker where no other
+    test has imported tools.terminal_tool. Failures here are non-fatal because
+    some environments lack optional native deps used by individual tool modules.
+    """
+    for mod in ("tools.terminal_tool", "tools.file_tools"):
+        try:
+            __import__(mod)
+        except Exception:
+            # Tool module may be unavailable in some environments; tests that
+            # require it will skip or fail with clearer errors than import-time.
+            pass

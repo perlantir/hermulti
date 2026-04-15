@@ -37,9 +37,12 @@ without spinning up a real LLM — see
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -133,6 +136,290 @@ class PersistentDelegateConfigError(PersistentDelegateError):
 
 
 # ---------------------------------------------------------------------------
+# Compile-result TTL cache — absorbs N-subagent fan-out on the same task.
+# ---------------------------------------------------------------------------
+
+
+_COMPILE_CACHE_TTL_SECONDS = 300.0  # 5 minutes
+_compile_cache: Dict[str, tuple] = {}  # key -> (expires_at, CompiledContext)
+_compile_cache_lock = asyncio.Lock()
+
+
+def _compile_cache_key(
+    project_id: str,
+    task: str,
+    *,
+    fast_mode: bool,
+    namespace: Optional[str],
+) -> str:
+    h = hashlib.sha256(task.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"{project_id}|{h}|{int(fast_mode)}|{namespace or '-'}"
+
+
+async def _compile_cache_get(key: str) -> Optional["CompiledContext"]:
+    async with _compile_cache_lock:
+        entry = _compile_cache.get(key)
+        if entry is None:
+            return None
+        expires_at, compiled = entry
+        if expires_at < time.monotonic():
+            _compile_cache.pop(key, None)
+            return None
+        return compiled
+
+
+async def _compile_cache_put(key: str, compiled: "CompiledContext") -> None:
+    async with _compile_cache_lock:
+        _compile_cache[key] = (
+            time.monotonic() + _COMPILE_CACHE_TTL_SECONDS,
+            compiled,
+        )
+
+
+def _compile_cache_clear() -> None:
+    """Test hook: drop all entries."""
+    _compile_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Task classifier — pick the cheapest compile mode for the task.
+# ---------------------------------------------------------------------------
+
+
+_SELF_CONTAINED_PATTERNS = (
+    re.compile(r"\bfrom scratch\b", re.I),
+    re.compile(r"\bhello[\s-]world\b", re.I),
+    re.compile(r"\bwrite\s+a\s+(?:simple|small|trivial|basic)\b", re.I),
+    re.compile(r"\bpure\s+function\b", re.I),
+)
+
+_TECHNICAL_KEYWORDS = (
+    "bug", "error", "fix", "crash", "stack trace", "traceback",
+    "exception", "how to", "debug",
+)
+
+_USER_KEYWORDS = (
+    "preference", "style", "like", "remember", "my ",
+    "i prefer", "i like", "remind me",
+)
+
+
+def classify_task(task_description: str) -> Dict[str, Any]:
+    """Classify a task into a compile-mode hint.
+
+    Returns a dict with one of:
+
+    * ``{"skip_compile": True}`` — self-contained tasks (e.g. "write a
+      hello world from scratch") don't need cross-session memory.
+    * ``{"namespace": "technical", "fast_mode": False}`` — debugging /
+      how-to tasks; use full compile scoped to technical namespace.
+    * ``{"namespace": "user", "fast_mode": True}`` — preference /
+      style / identity tasks; scope to user namespace.
+    * ``{"namespace": None, "fast_mode": True}`` — default: full
+      compile in fast mode, no namespace filter.
+
+    Uses the similarity-based ``router_classifier`` when available and
+    falls back to the keyword heuristic for short/empty inputs or when
+    the import is missing (import-cycle safety during test collection).
+
+    Also logs the routing decision to ``routing_outcomes`` when a similarity
+    decision was produced, so the feedback edge can learn over time.
+
+    Pure from the caller's perspective; the side-effect is append-only
+    logging to ``~/.hermes/routing_outcomes.jsonl``.
+    """
+    t = (task_description or "").lower().strip()
+    if not t:
+        return {"namespace": None, "fast_mode": True}
+
+    try:
+        from tools.router_classifier import classify as _similarity_classify
+        from tools.router_classifier import decision_to_classify_task_hint
+        from tools.routing_outcomes import record_decision
+
+        dec = _similarity_classify(task_description)
+        hint = decision_to_classify_task_hint(dec)
+        # Fire-and-forget log. Any failure must not break the routing path.
+        try:
+            record_decision(
+                task_description,
+                decided_class=dec.cls,
+                score=dec.score,
+                margin=dec.margin,
+                uncertain=dec.uncertain,
+            )
+        except Exception:
+            pass
+        return hint
+    except Exception:
+        # Fallback to the legacy keyword classifier below.
+        pass
+
+    # Self-contained heuristic: short tasks with "from scratch" /
+    # "hello world" markers and no proper nouns (uppercase words
+    # mid-sentence) are unlikely to benefit from memory.
+    for pat in _SELF_CONTAINED_PATTERNS:
+        if pat.search(task_description):
+            # Reject if the task mentions proper nouns mid-sentence,
+            # which usually means a project-specific reference.
+            tokens = task_description.split()
+            has_proper_noun = any(
+                i > 0 and tok[:1].isupper() and tok[1:2].islower()
+                for i, tok in enumerate(tokens)
+            )
+            if not has_proper_noun:
+                return {"skip_compile": True}
+            break
+
+    if any(k in t for k in _TECHNICAL_KEYWORDS):
+        return {"namespace": "technical", "fast_mode": False}
+
+    if any(k in t for k in _USER_KEYWORDS):
+        return {"namespace": "user", "fast_mode": True}
+
+    return {"namespace": None, "fast_mode": True}
+
+
+def _tokenize(text: str) -> set:
+    """Lowercase, split on non-word chars, drop short tokens/stopwords."""
+    _STOP = {
+        "the", "a", "an", "and", "or", "of", "to", "for", "in", "on",
+        "with", "is", "are", "was", "were", "be", "this", "that",
+        "it", "as", "at", "by", "from", "if", "you", "i", "we",
+    }
+    return {
+        w for w in re.findall(r"[a-z0-9]{3,}", text.lower())
+        if w not in _STOP
+    }
+
+
+def _slice_compiled_per_task(
+    broad: "CompiledContext",
+    tasks: List[str],
+) -> List["CompiledContext"]:
+    """Score each broad decision against each task and split per subagent.
+
+    Each decision goes to the subagent whose task shares the most
+    tokens with the decision text (ties broken by order). If no
+    subagent matches, the decision is dropped for that batch.
+    ``user_facts`` go to every subagent (project-wide preferences).
+    """
+    task_tokens = [_tokenize(t) for t in tasks]
+    n = len(tasks)
+    buckets: List[List[Dict[str, Any]]] = [[] for _ in range(n)]
+
+    for d in broad.decisions or []:
+        dtoks = _tokenize(str(d.get("text", "")))
+        if not dtoks:
+            continue
+        scores = [len(dtoks & tt) for tt in task_tokens]
+        best = max(scores) if scores else 0
+        if best == 0:
+            continue  # irrelevant to every subagent — drop
+        buckets[scores.index(best)].append(d)
+
+    return [
+        CompiledContext(
+            decisions=buckets[i],
+            total_tokens=sum(
+                int(d.get("tokens") or 0) for d in buckets[i]
+            ) or broad.total_tokens // max(n, 1),
+            cache_hit=broad.cache_hit,
+            role_signal=broad.role_signal,
+            contrastive_pairs=broad.contrastive_pairs,
+            degraded=broad.degraded,
+            degraded_reason=broad.degraded_reason,
+            decisions_considered=broad.decisions_considered,
+            decisions_included=len(buckets[i]),
+            user_facts=list(broad.user_facts or []),
+            compilation_time_ms=broad.compilation_time_ms,
+            token_count=broad.token_count,
+            raw_response={"sliced_from_batch": True},
+        )
+        for i in range(n)
+    ]
+
+
+_REDUNDANCY_THRESHOLD = 0.8  # 80% of decisions already present → skip
+
+
+def _drop_redundant_compiled(
+    compiled: "CompiledContext",
+    recent_messages: List[Dict[str, Any]],
+    *,
+    max_chars: int = 16_000,
+) -> "CompiledContext":
+    """Drop compiled decisions already carried by the conversation.
+
+    For each decision, compute token-overlap ratio against the
+    concatenated text of the last few messages. If >= 80% of tokens
+    appear in the conversation, drop it. If >= 80% of ALL decisions
+    are redundant, zero out the decisions list entirely (avoids a
+    nearly-empty compile block whose header adds noise).
+    """
+    if not compiled.decisions:
+        return compiled
+
+    # Join the tail of recent messages into one searchable blob.
+    buf: List[str] = []
+    remaining = max_chars
+    for m in reversed(recent_messages):
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, str) or not content:
+            continue
+        if len(content) > remaining:
+            buf.append(content[-remaining:])
+            break
+        buf.append(content)
+        remaining -= len(content)
+        if remaining <= 0:
+            break
+    convo_tokens = _tokenize(" ".join(buf))
+    if not convo_tokens:
+        return compiled
+
+    kept: List[Dict[str, Any]] = []
+    redundant = 0
+    for d in compiled.decisions:
+        dtoks = _tokenize(str(d.get("text", "")))
+        if not dtoks:
+            kept.append(d)
+            continue
+        overlap = len(dtoks & convo_tokens) / len(dtoks)
+        if overlap >= _REDUNDANCY_THRESHOLD:
+            redundant += 1
+        else:
+            kept.append(d)
+
+    total = len(compiled.decisions)
+    # If overwhelmingly redundant, drop everything.
+    if redundant / total >= _REDUNDANCY_THRESHOLD:
+        kept = []
+
+    if len(kept) == total:
+        return compiled  # nothing dropped; keep identity
+
+    return CompiledContext(
+        decisions=kept,
+        total_tokens=compiled.total_tokens,
+        cache_hit=compiled.cache_hit,
+        role_signal=compiled.role_signal,
+        contrastive_pairs=compiled.contrastive_pairs,
+        degraded=compiled.degraded,
+        degraded_reason=compiled.degraded_reason,
+        decisions_considered=compiled.decisions_considered,
+        decisions_included=len(kept),
+        user_facts=list(compiled.user_facts or []),
+        compilation_time_ms=compiled.compilation_time_ms,
+        token_count=compiled.token_count,
+        raw_response={
+            "skipped_redundant": total - len(kept),
+            "original": compiled.raw_response,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Core tool
 # ---------------------------------------------------------------------------
 
@@ -182,6 +469,8 @@ class PersistentDelegateTool:
         external_chat_id: Optional[str] = None,
         parent_agent: Optional[Any] = None,
         end_session: bool = False,
+        precompiled: Optional[CompiledContext] = None,
+        recent_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> PersistentDelegateResult:
         """Run a persistent delegate end-to-end.
 
@@ -233,10 +522,58 @@ class PersistentDelegateTool:
                 user_id=user_id,
                 external_chat_id=external_chat_id,
             )
-            compiled = await provider.compile(
-                task_description=task,
-                fast_mode=True,
-            )
+            hint = classify_task(task)
+            if precompiled is not None:
+                # Parent supplied a pre-sliced CompiledContext (fan-out
+                # path in invoke_batch). Skip the per-subagent compile
+                # round-trip entirely.
+                compiled = precompiled
+            elif hint.get("skip_compile"):
+                # Self-contained task: synthesize an empty CompiledContext
+                # rather than round-tripping to HIPP0. Saves one network
+                # call; the degraded flag stays False because this was an
+                # intentional skip, not a failure.
+                compiled = CompiledContext(
+                    decisions=[],
+                    total_tokens=0,
+                    cache_hit=False,
+                    degraded=False,
+                    raw_response={"skipped": "self_contained_task"},
+                )
+            else:
+                fast = bool(hint.get("fast_mode", True))
+                ns = hint.get("namespace")
+                cache_key = _compile_cache_key(
+                    str(profile.config.project_id),
+                    task,
+                    fast_mode=fast,
+                    namespace=ns,
+                )
+                compiled = await _compile_cache_get(cache_key)
+                if compiled is None:
+                    compiled = await provider.compile(
+                        task_description=task,
+                        fast_mode=fast,
+                        namespace=ns,
+                    )
+                    if not compiled.degraded:
+                        # Don't cache degraded results — they're local
+                        # fallbacks, and caching would pin us in the
+                        # degraded state past the 5m window.
+                        await _compile_cache_put(cache_key, compiled)
+            # If most compiled content is already present in the
+            # parent's recent messages, skip re-injection to save
+            # tokens + avoid nagging the model with duplicates.
+            effective_recent = recent_messages
+            if effective_recent is None and parent_agent is not None:
+                effective_recent = getattr(
+                    parent_agent, "_session_messages", None
+                )
+            if effective_recent:
+                compiled = _drop_redundant_compiled(
+                    compiled, effective_recent
+                )
+
             system_prompt = self._build_system_prompt(
                 profile, compiled, platform=platform,
             )
@@ -292,6 +629,101 @@ class PersistentDelegateTool:
             )
         finally:
             await provider.aclose()
+
+    async def invoke_batch(
+        self,
+        tasks: List[Dict[str, Any]],
+        *,
+        platform: str = "cli",
+        user_id: Optional[str] = None,
+        external_chat_id: Optional[str] = None,
+        parent_agent: Optional[Any] = None,
+        end_session: bool = False,
+    ) -> List[PersistentDelegateResult]:
+        """Fan out N subagents with a single shared compile.
+
+        ``tasks`` is a list of ``{"agent_name": ..., "task": ...}``.
+        The parent performs one broad compile (joined task descriptions)
+        and slices the returned decisions / user_facts per subagent
+        using simple token-overlap scoring; each subagent then runs
+        ``invoke()`` with that per-agent slice as ``precompiled``.
+
+        All subagents must share the same ``project_id`` — otherwise a
+        cross-project compile would leak context. Mixed-project batches
+        fall back to parallel per-task ``invoke()`` calls.
+        """
+        if not tasks:
+            return []
+
+        # Resolve profiles up-front so we can group by project.
+        profiles: List[AgentProfile] = []
+        for t in tasks:
+            name = t.get("agent_name")
+            if not name:
+                raise PersistentDelegateError(
+                    "invoke_batch: each task must have 'agent_name'"
+                )
+            try:
+                profiles.append(get_agent(name))
+            except AgentNotFoundError as e:
+                raise PersistentDelegateError(
+                    f"Persistent delegate {name!r} not registered: {e}"
+                ) from e
+
+        project_ids = {str(p.config.project_id) for p in profiles}
+        same_project = len(project_ids) == 1 and "None" not in project_ids
+
+        if not same_project or len(tasks) < 2:
+            # Nothing to share — fan out the unchanged per-task path.
+            return await asyncio.gather(*[
+                self.invoke(
+                    agent_name=t["agent_name"],
+                    task=t["task"],
+                    platform=platform,
+                    user_id=user_id,
+                    external_chat_id=external_chat_id,
+                    parent_agent=parent_agent,
+                    end_session=end_session,
+                )
+                for t in tasks
+            ])
+
+        # ── One broad compile for the whole batch ──────────────────────
+        # We borrow the first agent's provider to do the compile (same
+        # project_id by construction). The per-subagent invokes still
+        # need their own providers for session/capture — those are
+        # cheap compared to compile.
+        broad_task = "\n".join(t["task"] for t in tasks)
+        pilot_provider = self._make_provider(profiles[0])
+        try:
+            await pilot_provider.start_session(
+                platform=platform,
+                user_id=user_id,
+                external_chat_id=external_chat_id,
+            )
+            broad = await pilot_provider.compile(
+                task_description=broad_task,
+                fast_mode=True,
+            )
+        finally:
+            await pilot_provider.aclose()
+
+        # Slice per subagent.
+        slices = _slice_compiled_per_task(broad, [t["task"] for t in tasks])
+
+        return await asyncio.gather(*[
+            self.invoke(
+                agent_name=t["agent_name"],
+                task=t["task"],
+                platform=platform,
+                user_id=user_id,
+                external_chat_id=external_chat_id,
+                parent_agent=parent_agent,
+                end_session=end_session,
+                precompiled=s,
+            )
+            for t, s in zip(tasks, slices)
+        ])
 
     # ------------------------------------------------------------------ helpers
 

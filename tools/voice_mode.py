@@ -391,6 +391,10 @@ class AudioRecorder:
 
     supports_silence_autostop = True
 
+    @property
+    def is_recording(self) -> bool:
+        return self._recording
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._stream: Any = None

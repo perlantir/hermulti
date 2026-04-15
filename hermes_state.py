@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -97,21 +97,28 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestam
 FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
+    session_id UNINDEXED,
+    role UNINDEXED,
+    timestamp UNINDEXED,
     content=messages,
     content_rowid=id
 );
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+    INSERT INTO messages_fts(rowid, content, session_id, role, timestamp)
+    VALUES (new.id, new.content, new.session_id, new.role, new.timestamp);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+    INSERT INTO messages_fts(messages_fts, rowid, content, session_id, role, timestamp)
+    VALUES('delete', old.id, old.content, old.session_id, old.role, old.timestamp);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+    INSERT INTO messages_fts(messages_fts, rowid, content, session_id, role, timestamp)
+    VALUES('delete', old.id, old.content, old.session_id, old.role, old.timestamp);
+    INSERT INTO messages_fts(rowid, content, session_id, role, timestamp)
+    VALUES (new.id, new.content, new.session_id, new.role, new.timestamp);
 END;
 """
 
@@ -145,6 +152,14 @@ class SessionDB:
 
         self._lock = threading.Lock()
         self._write_count = 0
+        # In-process TTL cache for the "top-10 recent sessions" dashboard
+        # query — by far the hottest list_sessions_rich() call.  Keyed by
+        # (source, tuple(exclude_sources), include_children).  Values are
+        # (expires_at, [session_dicts]).  5-minute TTL is deliberately
+        # coarse; session staleness is acceptable on a dashboard.
+        self._recent_cache: Dict[tuple, tuple] = {}
+        self._RECENT_CACHE_TTL_S = 300.0
+        self._RECENT_CACHE_MAX_LIMIT = 10
         self._conn = sqlite3.connect(
             str(self.db_path),
             check_same_thread=False,
@@ -366,6 +381,32 @@ class SessionDB:
                 except sqlite3.OperationalError:
                     pass
                 cursor.execute("UPDATE schema_version SET version = 8")
+            if current_version < 9:
+                # v9: expand messages_fts to index session_id, role, timestamp
+                # (UNINDEXED columns) so per-session / per-role filters can be
+                # pushed into the FTS layer instead of JOIN-filtered afterwards.
+                # Must drop the old FTS table + triggers and rebuild from
+                # messages because FTS5 schema is immutable once created.
+                for name in (
+                    "messages_fts_insert",
+                    "messages_fts_delete",
+                    "messages_fts_update",
+                ):
+                    try:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+                    except sqlite3.OperationalError:
+                        pass
+                try:
+                    cursor.execute("DROP TABLE IF EXISTS messages_fts")
+                except sqlite3.OperationalError:
+                    pass
+                cursor.executescript(FTS_SQL)
+                # Rebuild: populate FTS from existing messages.
+                cursor.execute(
+                    "INSERT INTO messages_fts(rowid, content, session_id, role, timestamp) "
+                    "SELECT id, content, session_id, role, timestamp FROM messages"
+                )
+                cursor.execute("UPDATE schema_version SET version = 9")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -379,9 +420,30 @@ class SessionDB:
 
         # FTS5 setup (separate because CREATE VIRTUAL TABLE can't be in executescript with IF NOT EXISTS reliably)
         try:
-            cursor.execute("SELECT * FROM messages_fts LIMIT 0")
+            # Probe with the v9 column set — if any column is missing this
+            # raises OperationalError and we rebuild below.
+            cursor.execute(
+                "SELECT content, session_id, role, timestamp FROM messages_fts LIMIT 0"
+            )
         except sqlite3.OperationalError:
+            for name in (
+                "messages_fts_insert",
+                "messages_fts_delete",
+                "messages_fts_update",
+            ):
+                try:
+                    cursor.execute(f"DROP TRIGGER IF EXISTS {name}")
+                except sqlite3.OperationalError:
+                    pass
+            try:
+                cursor.execute("DROP TABLE IF EXISTS messages_fts")
+            except sqlite3.OperationalError:
+                pass
             cursor.executescript(FTS_SQL)
+            cursor.execute(
+                "INSERT INTO messages_fts(rowid, content, session_id, role, timestamp) "
+                "SELECT id, content, session_id, role, timestamp FROM messages"
+            )
 
         self._conn.commit()
 
@@ -795,7 +857,30 @@ class SessionDB:
 
         By default, child sessions (subagent runs, compression continuations)
         are excluded.  Pass ``include_children=True`` to include them.
+
+        Results for offset=0 and limit<=10 are served from a 5-minute TTL
+        cache to absorb dashboard polling without hitting SQLite each time.
         """
+        # Cache the top-N (N<=10) hot-path call.  Larger pages / offsets
+        # bypass the cache.
+        cache_key: Optional[tuple] = None
+        if offset == 0 and limit <= self._RECENT_CACHE_MAX_LIMIT:
+            cache_key = (
+                source,
+                tuple(exclude_sources) if exclude_sources else (),
+                bool(include_children),
+                int(limit),
+            )
+            entry = self._recent_cache.get(cache_key)
+            if entry is not None:
+                expires_at, cached = entry
+                if expires_at > time.time():
+                    # Return a deep-ish copy so callers can mutate without
+                    # corrupting the cache.
+                    return [dict(s) for s in cached]
+                # Expired — drop.
+                self._recent_cache.pop(cache_key, None)
+
         where_clauses = []
         params = []
 
@@ -844,6 +929,12 @@ class SessionDB:
             else:
                 s["preview"] = ""
             sessions.append(s)
+
+        if cache_key is not None:
+            self._recent_cache[cache_key] = (
+                time.time() + self._RECENT_CACHE_TTL_S,
+                [dict(s) for s in sessions],
+            )
 
         return sessions
 
@@ -1293,9 +1384,16 @@ class SessionDB:
                 list(session_ids),
             )
 
-            for sid in session_ids:
-                conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-                conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+            # Single IN-list DELETE per table instead of 2*N statements.
+            id_list = list(session_ids)
+            conn.execute(
+                f"DELETE FROM messages WHERE session_id IN ({placeholders})",
+                id_list,
+            )
+            conn.execute(
+                f"DELETE FROM sessions WHERE id IN ({placeholders})",
+                id_list,
+            )
             return len(session_ids)
 
         return self._execute_write(_do)

@@ -504,6 +504,47 @@ class APIServerAdapter(BasePlatformAdapter):
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "hermes-agent"})
 
+    async def _handle_routing_quality(self, request: "web.Request") -> "web.Response":
+        """GET /admin/routing-quality — per-class routing + outcome stats.
+
+        Aggregates ``~/.hermes/routing_outcomes.jsonl`` into one entry per
+        router class (technical / user / self_contained / ambiguous) with
+        the total decisions made and the distribution of downstream outcomes.
+        Consumed by Phase 13's nightly threshold-tuning job and ad-hoc
+        dashboards.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from tools.routing_outcomes import aggregate, positive_rate
+        except Exception as err:
+            return web.json_response(
+                {"error": "routing_outcomes_unavailable", "detail": str(err)},
+                status=503,
+            )
+
+        try:
+            agg = aggregate()
+        except Exception as err:
+            return web.json_response(
+                {"error": "aggregation_failed", "detail": str(err)},
+                status=500,
+            )
+
+        payload = {}
+        for cls, data in agg.items():
+            payload[cls] = {
+                "decision_count": data.count,
+                "outcomes": dict(data.outcomes),
+                "positive_rate": positive_rate(data),
+            }
+        return web.json_response({
+            "generated_at": int(time.time()),
+            "classes": payload,
+        })
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
         auth_err = self._check_auth(request)
@@ -1740,6 +1781,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            # Phase 13 observability: routing quality aggregated over the
+            # routing-outcomes JSONL log.
+            self._app.router.add_get("/admin/routing-quality", self._handle_routing_quality)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

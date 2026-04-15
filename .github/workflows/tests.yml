@@ -37,12 +37,20 @@ jobs:
       - name: Run tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
+          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --ignore=tests/bench --tb=short -n auto
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+      - name: Hot-path bench (Phase 11 perf gate)
+        # Runs after the main suite so a perf regression lands with a clean
+        # signal rather than buried in the full-suite summary. Serial run
+        # avoids xdist's worker variance dominating the p95 samples.
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/bench/ -o addopts='' --tb=short
 
   e2e:
     runs-on: ubuntu-latest
@@ -67,6 +75,36 @@ jobs:
         run: |
           source .venv/bin/activate
           python -m pytest tests/e2e/ -v --tb=short
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+  closed-loop:
+    # Phase 10 gate: the full task -> subagent -> compile -> outcome ->
+    # attribution -> re-rank chain must stay green on every push/PR.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+
+      - name: Run closed-loop integration test
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/integration/test_closed_loop.py -v
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

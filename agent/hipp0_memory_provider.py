@@ -65,6 +65,78 @@ _DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
 _RETRY_ATTEMPTS = 3
 _RETRY_INITIAL_DELAY = 0.4  # seconds; doubles each retry
 
+# Circuit breaker tuning for compile(). Three unavailable events inside
+# a 60s sliding window trips the breaker OPEN for 2 minutes; the next
+# call after cooldown is a HALF_OPEN probe. A success on probe closes
+# the breaker. A failure on probe re-opens it for another 2 minutes.
+_CB_FAIL_THRESHOLD = 3
+_CB_WINDOW_SECONDS = 60.0
+_CB_OPEN_SECONDS = 120.0
+
+# Prepend a stale-memory marker to the rendered compile block when the
+# last successful compile is older than this OR the breaker is OPEN.
+_STALE_MEMORY_THRESHOLD_SECONDS = 30 * 60
+
+
+class _CompileCircuitBreaker:
+    """Minimal circuit breaker for Hipp0MemoryProvider.compile().
+
+    State transitions:
+      CLOSED --(3 timeouts in 60s)--> OPEN
+      OPEN   --(2m elapsed)--------->  HALF_OPEN  (on next call)
+      HALF_OPEN --(success)---------> CLOSED
+      HALF_OPEN --(failure)---------> OPEN (new 2m cooldown)
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_threshold: int = _CB_FAIL_THRESHOLD,
+        window_seconds: float = _CB_WINDOW_SECONDS,
+        open_seconds: float = _CB_OPEN_SECONDS,
+        clock: Optional[Any] = None,
+    ) -> None:
+        self._fail_threshold = fail_threshold
+        self._window = window_seconds
+        self._open_for = open_seconds
+        self._clock = clock or time.monotonic
+        self._failures: List[float] = []
+        self._state: str = "CLOSED"
+        self._opened_at: Optional[float] = None
+
+    @property
+    def state(self) -> str:
+        # Lazy transition OPEN -> HALF_OPEN when cooldown elapsed.
+        if self._state == "OPEN" and self._opened_at is not None:
+            if self._clock() - self._opened_at >= self._open_for:
+                self._state = "HALF_OPEN"
+        return self._state
+
+    def allow(self) -> bool:
+        """Return True if a call should proceed, False if short-circuited."""
+        return self.state != "OPEN"
+
+    def record_success(self) -> None:
+        self._failures.clear()
+        self._state = "CLOSED"
+        self._opened_at = None
+
+    def record_failure(self) -> None:
+        now = self._clock()
+        if self._state == "HALF_OPEN":
+            # Probe failed: re-open for a fresh cooldown.
+            self._state = "OPEN"
+            self._opened_at = now
+            self._failures = [now]
+            return
+        # Trim outside-window failures and append the new one.
+        cutoff = now - self._window
+        self._failures = [t for t in self._failures if t >= cutoff]
+        self._failures.append(now)
+        if len(self._failures) >= self._fail_threshold:
+            self._state = "OPEN"
+            self._opened_at = now
+
 
 # ---------------------------------------------------------------------------
 # Response dataclasses
@@ -93,6 +165,9 @@ class CompiledContext:
     compilation_time_ms: int = 0
     token_count: int = 0
     raw_response: Optional[Dict[str, Any]] = None
+    # Minutes since the provider's last successful compile(). Set when
+    # the breaker is OPEN or recall is stale (>30m). None = fresh.
+    stale_minutes: Optional[int] = None
 
     def as_prompt_block(self) -> str:
         """Render the compiled context as a plain-text prompt block.
@@ -108,7 +183,12 @@ class CompiledContext:
         else:
             header = "## Compiled context"
 
-        lines = [header, ""]
+        lines: List[str] = []
+        if self.stale_minutes is not None:
+            lines.append(
+                f"[STALE MEMORY: last successful compile {self.stale_minutes}m ago]"
+            )
+        lines.extend([header, ""])
         if self.decisions:
             for d in self.decisions:
                 text = d.get("text", "")
@@ -124,12 +204,23 @@ class CompiledContext:
         # without this block the agent cannot recall cross-agent preferences
         # even though /api/compile returns them in the JSON payload.
         if self.user_facts:
-            lines.append("")
-            lines.append(f"## User Facts ({len(self.user_facts)})")
+            rendered: List[str] = []
             for f in self.user_facts:
-                key = f.get("key") or f.get("fact_key") or "?"
-                value = f.get("value") or f.get("fact_value") or ""
-                lines.append(f"- **{key}**: {value}")
+                # Strict schema: require "key". Log-and-drop malformed
+                # entries so the legacy `fact_key` fallback can't mask a
+                # broken HIPP0 contract.
+                key = f.get("key")
+                if not isinstance(key, str) or not key:
+                    logger.warning(
+                        "HIPP0 user_fact missing 'key'; dropping entry: %r", f
+                    )
+                    continue
+                value = f.get("value", "")
+                rendered.append(f"- **{key}**: {value}")
+            if rendered:
+                lines.append("")
+                lines.append(f"## User Facts ({len(rendered)})")
+                lines.extend(rendered)
         return "\n".join(lines)
 
 
@@ -191,6 +282,17 @@ class Hipp0MemoryProvider(MemoryProvider):
         self._memory_md_path = Path(memory_md_path) if memory_md_path else None
 
         self._session_id: Optional[str] = None
+
+        self._compile_breaker = _CompileCircuitBreaker()
+        # Wall-clock timestamp of the last successful compile(). Used by
+        # CompiledContext.as_prompt_block() to render a stale-memory
+        # marker when recall may be out of date.
+        self._last_compile_success_ts: Optional[float] = None
+
+        # Serialize WAL file I/O so concurrent _wal_append / _drain_wal
+        # calls cannot interleave read→write and lose records. Created
+        # lazily on first use to bind to the correct event loop.
+        self._wal_lock: Optional[asyncio.Lock] = None
 
         self._client = client or httpx.AsyncClient(
             base_url=self.base_url,
@@ -365,6 +467,13 @@ class Hipp0MemoryProvider(MemoryProvider):
                 "explain": "false",
             }
 
+        # Circuit breaker: short-circuit to degraded-mode while OPEN so we
+        # don't pile up doomed requests against a dead HIPP0.
+        if not self._compile_breaker.allow():
+            return self._degraded_compile(
+                f"circuit breaker OPEN (cooldown {int(_CB_OPEN_SECONDS)}s)"
+            )
+
         try:
             data = await self._post_json(
                 "/api/compile",
@@ -374,13 +483,18 @@ class Hipp0MemoryProvider(MemoryProvider):
                 allow_wal=False,  # compile is read; no point queueing
             )
         except Hipp0UnavailableError as e:
+            self._compile_breaker.record_failure()
             return self._degraded_compile(str(e))
         except Hipp0HTTPError as e:
             # 4xx is a hard contract bug — surface it. 5xx fell through
             # to Hipp0UnavailableError via retry.
             if 500 <= e.status_code < 600:
+                self._compile_breaker.record_failure()
                 return self._degraded_compile(str(e))
             raise
+
+        self._compile_breaker.record_success()
+        self._last_compile_success_ts = time.time()
 
         return CompiledContext(
             decisions=list(data.get("decisions") or []),
@@ -430,6 +544,36 @@ class Hipp0MemoryProvider(MemoryProvider):
         if note is not None:
             payload["note"] = note
         await self._post_json("/api/hermes/outcomes", payload, wal_kind="outcome")
+
+    async def record_decision(
+        self,
+        title: str,
+        rationale: str,
+        tags: Optional[List[str]] = None,
+        confidence: str = "medium",
+        agent_name: Optional[str] = None,
+    ) -> bool:
+        """Record a decision signal to hipp0. Non-fatal on failure."""
+        if not self.project_id:
+            return False
+        try:
+            # hipp0 requires `description` (not `content`) and `project_id`
+            # on the unscoped /api/decisions route. Omitting either yields a
+            # 400 VALIDATION_ERROR.
+            payload: Dict[str, Any] = {
+                "project_id": self.project_id,
+                "title": title,
+                "description": rationale,
+                "made_by": agent_name or "hermes",
+                "tags": tags or [],
+                "confidence": confidence,
+                "source": "auto_capture",
+            }
+            data = await self._post_json("/api/decisions", payload)
+            return bool(data) or True
+        except Exception as exc:
+            logger.debug("[hipp0] record_decision failed: %s", exc)
+            return False
 
     async def upsert_user_fact(
         self,
@@ -552,6 +696,54 @@ class Hipp0MemoryProvider(MemoryProvider):
 
     # ----------------------------------------------------------------- WAL
 
+    def _get_wal_lock(self) -> asyncio.Lock:
+        if self._wal_lock is None:
+            self._wal_lock = asyncio.Lock()
+        return self._wal_lock
+
+    @staticmethod
+    def _write_secure(path: Path, content: str) -> None:
+        """Atomically write *content* to *path* with 0o600 permissions.
+
+        Writes to a sibling tmp file, chmods before rename so the mode
+        is applied before the file is visible at the final name.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        # os.open + write to set mode atomically (avoids umask-dependent
+        # initial perms that Path.write_text would create).
+        import os as _os
+        fd = _os.open(tmp, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+        try:
+            with _os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+        _os.replace(tmp, path)
+
+    @staticmethod
+    def _append_secure(path: Path, line: str) -> None:
+        """Append *line* to *path*, creating it with 0o600 if missing."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import os as _os
+        # O_APPEND is atomic on POSIX for writes < PIPE_BUF; JSON lines
+        # here are always under that. Create with 0o600 if not present.
+        existed = path.exists()
+        fd = _os.open(path, _os.O_WRONLY | _os.O_CREAT | _os.O_APPEND, 0o600)
+        try:
+            with _os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(line)
+        finally:
+            if not existed:
+                try:
+                    _os.chmod(path, 0o600)
+                except OSError:
+                    pass
+
     def _wal_append(self, record: Dict[str, Any]) -> None:
         if not self._pending_wal_path:
             logger.error(
@@ -559,64 +751,103 @@ class Hipp0MemoryProvider(MemoryProvider):
                 record.get("kind"),
             )
             return
-        self._pending_wal_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._pending_wal_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        self._append_secure(self._pending_wal_path, json.dumps(record) + "\n")
 
     async def _drain_wal(self) -> None:
-        """Replay WAL entries oldest-first. Drops on success, keeps on failure."""
+        """Replay WAL entries oldest-first. Drops on success, keeps on failure.
+
+        Serialized under _wal_lock so a concurrent _wal_append cannot be
+        lost between the read and the rewrite, and so two concurrent
+        drains cannot double-post records.
+        """
         if not self._pending_wal_path or not self._pending_wal_path.exists():
             return
-        try:
-            lines = self._pending_wal_path.read_text(encoding="utf-8").splitlines()
-        except OSError as e:
-            logger.warning("HIPP0 WAL: could not read %s: %s", self._pending_wal_path, e)
+        async with self._get_wal_lock():
+            if not self._pending_wal_path.exists():
+                return
+            try:
+                lines = self._pending_wal_path.read_text(encoding="utf-8").splitlines()
+            except OSError as e:
+                logger.warning("HIPP0 WAL: could not read %s: %s", self._pending_wal_path, e)
+                return
+
+            remaining: List[str] = []
+            for i, line in enumerate(lines):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning("HIPP0 WAL: dropping malformed line %d", i)
+                    continue
+                try:
+                    resp = await self._client.post(
+                        record["path"],
+                        json=record.get("body") or {},
+                        params=record.get("params"),
+                        headers=record.get("headers"),
+                    )
+                except (httpx.TransportError, httpx.TimeoutException):
+                    # Keep this line and all subsequent lines in order.
+                    remaining.append(line)
+                    remaining.extend(lines[i + 1 :])
+                    break
+                if resp.status_code >= 500:
+                    remaining.append(line)
+                    remaining.extend(lines[i + 1 :])
+                    break
+                # 4xx: bad contract — move to dead_letter.jsonl for operator
+                # inspection rather than silently dropping. 2xx: drop normally.
+                if resp.status_code >= 400:
+                    logger.warning(
+                        "HIPP0 WAL: dead-lettering 4xx entry %s (%d)",
+                        record.get("kind"),
+                        resp.status_code,
+                    )
+                    self._dead_letter_append(record, resp.status_code, resp.text)
+                continue
+
+            if remaining:
+                self._write_secure(
+                    self._pending_wal_path, "\n".join(remaining) + "\n"
+                )
+            else:
+                try:
+                    self._pending_wal_path.unlink()
+                except OSError:
+                    pass
+
+    def _dead_letter_path(self) -> Optional[Path]:
+        if not self._pending_wal_path:
+            return None
+        return self._pending_wal_path.with_name("dead_letter.jsonl")
+
+    def _dead_letter_append(
+        self, record: Dict[str, Any], status_code: int, error_body: str
+    ) -> None:
+        dl_path = self._dead_letter_path()
+        if dl_path is None:
             return
+        entry = {
+            **record,
+            "dead_letter_timestamp": time.time(),
+            "status_code": status_code,
+            "error_body": error_body[:2000],
+        }
+        self._append_secure(dl_path, json.dumps(entry) + "\n")
 
-        remaining: List[str] = []
-        for i, line in enumerate(lines):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning("HIPP0 WAL: dropping malformed line %d", i)
-                continue
-            try:
-                resp = await self._client.post(
-                    record["path"],
-                    json=record.get("body") or {},
-                    params=record.get("params"),
-                    headers=record.get("headers"),
-                )
-            except (httpx.TransportError, httpx.TimeoutException):
-                # Keep this line and all subsequent lines in order.
-                remaining.append(line)
-                remaining.extend(lines[i + 1 :])
-                break
-            if resp.status_code >= 500:
-                remaining.append(line)
-                remaining.extend(lines[i + 1 :])
-                break
-            # 4xx or 2xx: drop the entry (4xx means bad contract; there's
-            # no point retrying a malformed request forever).
-            if resp.status_code >= 400:
-                logger.warning(
-                    "HIPP0 WAL: dropping 4xx entry %s on drain (%d)",
-                    record.get("kind"),
-                    resp.status_code,
-                )
-            continue
-
-        if remaining:
-            self._pending_wal_path.write_text(
-                "\n".join(remaining) + "\n", encoding="utf-8"
+    def dead_letter_size(self) -> int:
+        """Return the number of dead-lettered entries (observability helper)."""
+        dl_path = self._dead_letter_path()
+        if not dl_path or not dl_path.exists():
+            return 0
+        try:
+            return sum(
+                1 for line in dl_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
             )
-        else:
-            try:
-                self._pending_wal_path.unlink()
-            except OSError:
-                pass
+        except OSError:
+            return 0
 
     def wal_size(self) -> int:
         """Return the number of queued WAL entries (test + observability helper)."""
@@ -656,7 +887,8 @@ class Hipp0MemoryProvider(MemoryProvider):
                     }
                 )
                 # Rough token estimate: 4 chars per token.
-                total_tokens = max(1, len(text) // 4)
+                from agent.model_metadata import estimate_tokens_rough
+                total_tokens = max(1, estimate_tokens_rough(text))
         logger.warning("HIPP0 compile degraded: %s", reason)
         return CompiledContext(
             decisions=decisions,
@@ -664,4 +896,23 @@ class Hipp0MemoryProvider(MemoryProvider):
             cache_hit=False,
             degraded=True,
             degraded_reason=reason,
+            stale_minutes=self._compute_stale_minutes(force=True),
         )
+
+    def _compute_stale_minutes(self, *, force: bool = False) -> Optional[int]:
+        """Return minutes since last successful compile, or None if fresh.
+
+        When ``force`` is True (degraded path, or breaker open) we always
+        emit a staleness number — 999 if nothing has ever succeeded —
+        so callers can render the stale-memory marker. Otherwise we only
+        return a value when the breaker is OPEN or the gap exceeds
+        ``_STALE_MEMORY_THRESHOLD_SECONDS``.
+        """
+        now = time.time()
+        last = self._last_compile_success_ts
+        if last is None:
+            return 999 if force else None
+        gap = now - last
+        if force or self._compile_breaker.state == "OPEN" or gap >= _STALE_MEMORY_THRESHOLD_SECONDS:
+            return max(0, int(gap // 60))
+        return None
