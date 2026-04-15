@@ -378,7 +378,8 @@ class TestBlockingApprovalE2E:
         t = threading.Thread(target=agent_thread)
         t.start()
 
-        for _ in range(50):
+        # 10s wait: robust against xdist worker load
+        for _ in range(200):
             if notified:
                 break
             time.sleep(0.05)
@@ -423,7 +424,7 @@ class TestBlockingApprovalE2E:
 
         t = threading.Thread(target=agent_thread)
         t.start()
-        for _ in range(50):
+        for _ in range(200):
             if notified:
                 break
             time.sleep(0.05)
@@ -509,8 +510,8 @@ class TestBlockingApprovalE2E:
         for t in threads:
             t.start()
 
-        # Wait for all 3 to block
-        for _ in range(100):
+        # Wait for all 3 to block (10s: robust against xdist worker load)
+        for _ in range(200):
             if len(notified) >= 3:
                 break
             time.sleep(0.05)
@@ -567,7 +568,7 @@ class TestBlockingApprovalE2E:
         # relying on a fixed sleep.  The approval module stores entries in
         # _gateway_queues[session_key] — poll until we see 2 entries.
         from tools.approval import _gateway_queues
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if len(_gateway_queues.get(session_key, [])) >= 2:
                 break
