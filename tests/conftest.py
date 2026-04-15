@@ -156,6 +156,10 @@ def _isolate_models_dev_cache():
 
     saved_cache = getattr(_md, "_models_dev_cache", None)
     saved_time = getattr(_md, "_models_dev_cache_time", None)
+    # Shallow-copy the dict so in-place mutations during the test don't bleed
+    # back into the saved snapshot.
+    if isinstance(saved_cache, dict):
+        saved_cache = dict(saved_cache)
     try:
         yield
     finally:
