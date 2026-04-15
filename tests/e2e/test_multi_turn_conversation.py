@@ -31,26 +31,52 @@ def test_session_end_records_outcome():
     assert proj.status_code in (200, 201), proj.text
     project_id = proj.json()['id']
 
-    # Record a decision
+    # Register a hermes agent - /api/hermes/session/start requires it.
+    agent_name = 'e2e-multi-turn-agent'
+    reg = httpx.post(
+        f'{HIPP0_BASE_URL}/api/hermes/register',
+        json={
+            'project_id': project_id,
+            'agent_name': agent_name,
+            'soul': '# Soul\nE2E multi-turn agent.',
+            'config': {'model': 'gpt-4o-mini', 'platform_access': ['web']},
+        },
+        timeout=5,
+    )
+    assert reg.status_code in (200, 201), reg.text
+
+    # Record a decision (hipp0 expects `description`, not `content`).
     httpx.post(
         f'{HIPP0_BASE_URL}/api/projects/{project_id}/decisions',
         json={
             'made_by': 'architect',
             'title': 'Multi-turn test decision',
-            'content': 'Placed during multi-turn E2E test.',
+            'description': 'Placed during multi-turn E2E test.',
             'tags': ['e2e'],
             'confidence': 'high',
         },
         timeout=5,
     )
 
+    # Start a real session to get a UUID session_id. hipp0 enforces
+    # `session_id must be a valid UUID` on /session/end.
+    start = httpx.post(
+        f'{HIPP0_BASE_URL}/api/hermes/session/start',
+        json={
+            'project_id': project_id,
+            'agent_name': agent_name,
+            'platform': 'web',
+        },
+        timeout=5,
+    )
+    assert start.status_code in (200, 201), start.text
+    session_id = start.json()['session_id']
+
     # End the session with a positive outcome
     end = httpx.post(
         f'{HIPP0_BASE_URL}/api/hermes/session/end',
         json={
-            'project_id': project_id,
-            'session_id': 'e2e-multi-turn-session-1',
-            'ended_at': '2026-04-15T12:00:00Z',
+            'session_id': session_id,
             'outcome': {
                 'rating': 'positive',
                 'signal_source': 'user_feedback',

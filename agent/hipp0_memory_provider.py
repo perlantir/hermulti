@@ -557,9 +557,13 @@ class Hipp0MemoryProvider(MemoryProvider):
         if not self.project_id:
             return False
         try:
+            # hipp0 requires `description` (not `content`) and `project_id`
+            # on the unscoped /api/decisions route. Omitting either yields a
+            # 400 VALIDATION_ERROR.
             payload: Dict[str, Any] = {
+                "project_id": self.project_id,
                 "title": title,
-                "content": rationale,
+                "description": rationale,
                 "made_by": agent_name or "hermes",
                 "tags": tags or [],
                 "confidence": confidence,
