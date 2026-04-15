@@ -10071,6 +10071,30 @@ class AIAgent:
         except Exception as exc:
             logger.debug("turn-boundary record_outcome failed: %s", exc)
 
+        # Decision signal capture — passive extraction from assistant's turn text.
+        try:
+            _hipp0_provider = getattr(self, 'hipp0_provider', None)
+            if not _hipp0_provider and self._memory_manager:
+                for _p in self._memory_manager.providers:
+                    if type(_p).__name__ == "Hipp0MemoryProvider":
+                        _hipp0_provider = _p
+                        break
+            if final_response and _hipp0_provider:
+                from agent.outcome_signals import extract_decision_signals
+                decision_signals = extract_decision_signals(final_response, agent_name=self._agent_name)
+                for sig in decision_signals:
+                    asyncio.create_task(
+                        _hipp0_provider.record_decision(
+                            title=sig.title,
+                            rationale=sig.rationale,
+                            tags=sig.tags,
+                            confidence=sig.confidence,
+                            agent_name=self._agent_name,
+                        )
+                    )
+        except Exception:
+            pass
+
         return result
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:

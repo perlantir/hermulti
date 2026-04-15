@@ -545,6 +545,32 @@ class Hipp0MemoryProvider(MemoryProvider):
             payload["note"] = note
         await self._post_json("/api/hermes/outcomes", payload, wal_kind="outcome")
 
+    async def record_decision(
+        self,
+        title: str,
+        rationale: str,
+        tags: Optional[List[str]] = None,
+        confidence: str = "medium",
+        agent_name: Optional[str] = None,
+    ) -> bool:
+        """Record a decision signal to hipp0. Non-fatal on failure."""
+        if not self.project_id:
+            return False
+        try:
+            payload: Dict[str, Any] = {
+                "title": title,
+                "content": rationale,
+                "made_by": agent_name or "hermes",
+                "tags": tags or [],
+                "confidence": confidence,
+                "source": "auto_capture",
+            }
+            data = await self._post_json("/api/decisions", payload)
+            return bool(data) or True
+        except Exception as exc:
+            logger.debug("[hipp0] record_decision failed: %s", exc)
+            return False
+
     async def upsert_user_fact(
         self,
         user_id: str,
