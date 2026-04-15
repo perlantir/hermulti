@@ -199,8 +199,14 @@ async def test_internal_event_does_not_trigger_pairing(monkeypatch, tmp_path):
 async def test_non_internal_event_without_user_triggers_pairing(monkeypatch, tmp_path):
     """Verify the normal (non-internal) path still triggers pairing for unknown users."""
     import gateway.run as gateway_run
+    import gateway.pairing as pairing_mod
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    # Redirect PAIRING_DIR to tmp_path so rate-limit state from other tests
+    # (which share the real ~/.hermes/platforms/pairing dir) does not leak in.
+    pairing_tmp = tmp_path / "pairing"
+    pairing_tmp.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(pairing_mod, "PAIRING_DIR", pairing_tmp)
     (tmp_path / "config.yaml").write_text("", encoding="utf-8")
 
     # Clear env vars that could let all users through (loaded by
